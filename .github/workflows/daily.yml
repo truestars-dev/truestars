@@ -1,0 +1,46 @@
+name: Daily update
+on:
+  schedule:
+    - cron: "0 14 * * *"   # 14:00 UTC = 6 or 7 a.m. Pacific, after GitHub's star day has closed
+  workflow_dispatch:
+permissions:
+  contents: write   # commit the day's history file
+  pages: write      # publish the site
+  id-token: write
+concurrency:
+  group: daily
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect today's data and build the site
+        run: python3 -I truestars.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Save the day's history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/days
+          git diff --cached --quiet || git commit -m "Daily data $(date -u +%F)"
+          git push
+      - if: vars.PAGES_ON == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  # Publishing waits for go-live: GitHub Pages is free only for public repos. At launch: make the
+  # repo public, turn Pages on (source: GitHub Actions) and set the repo variable PAGES_ON to true.
+  deploy:
+    needs: update
+    if: vars.PAGES_ON == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
