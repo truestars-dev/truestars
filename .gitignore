@@ -1,0 +1,7 @@
+data/latest.json
+data/*.tmp
+site/
+logs/
+__pycache__/
+run-daily.sh
+daily.off
