@@ -481,7 +481,17 @@ def why_chips(row):
     return "".join(chips)
 
 
-def shell(title, body, root, description, updated):
+def shell(title, body, root, description, updated, path=None):
+    # path: the page's address under SITE_URL ("" = home); None = no canonical link (the 404 page)
+    share = ""
+    if path is not None:
+        url = esc(f"{SITE_URL}/{path}")
+        share = (f'<link rel="canonical" href="{url}">\n'
+                 f'<meta property="og:type" content="website">\n'
+                 f'<meta property="og:site_name" content="TrueStars">\n'
+                 f'<meta property="og:title" content="{esc(title)}">\n'
+                 f'<meta property="og:description" content="{esc(description)}">\n'
+                 f'<meta property="og:url" content="{url}">\n')
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -489,7 +499,7 @@ def shell(title, body, root, description, updated):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(title)}</title>
 <meta name="description" content="{esc(description)}">
-<link rel="stylesheet" href="{root}style.css">
+{share}<link rel="stylesheet" href="{root}style.css">
 <link rel="icon" href="{root}favicon.svg" type="image/svg+xml">
 </head>
 <body>
@@ -580,7 +590,7 @@ def render_index(rows, day, latest, data, updated):
     write(os.path.join(SITE, "index.html"), shell(
         "TrueStars: GitHub repos gaining stars fastest, checked for fake stars", body, root,
         "Daily ranking of the GitHub repos gaining stars fastest, with every repo checked for signs of fake stars.",
-        updated))
+        updated, path=""))
 
 
 INDEX_JS = """
@@ -700,7 +710,8 @@ def render_repo(slug, entry, fresh, latest, updated):
   <script>{COPY_JS}</script>"""
     write(os.path.join(SITE, "r", slug, "index.html"), shell(
         f"{row['name']} on TrueStars", body, root,
-        f"{row['name']}: daily stars, best rank #{best} and a fake-star check.", updated))
+        f"{row['name']}: daily stars, best rank #{best} and a fake-star check.", updated,
+        path=f"r/{slug}/"))
 
 
 def text_width(text):
@@ -779,7 +790,7 @@ def render_how(updated):
   </section>"""
     write(os.path.join(SITE, "how", "index.html"), shell(
         "How TrueStars works", body, root,
-        "How TrueStars counts stars, checks for fake stars and ranks GitHub repos.", updated))
+        "How TrueStars counts stars, checks for fake stars and ranks GitHub repos.", updated, path="how/"))
 
 
 def write(path, text):
@@ -830,6 +841,15 @@ def build():
     write(os.path.join(SITE, "404.html"), shell(
         "Not found · TrueStars", '<h1>Page not found</h1><p>This repo has not been in the ranking yet. '
         '<a href="/index.html">See today\'s ranking</a>.</p>', "/", "Page not found.", updated))
+    # Search engines: every page that rendered above, home and How first
+    pages = ["", "how/"] + [f"r/{slug}/" for slug in sorted(history)
+                            if os.path.exists(os.path.join(SITE, "r", slug, "index.html"))]
+    write(os.path.join(SITE, "sitemap.xml"),
+          '<?xml version="1.0" encoding="UTF-8"?>\n'
+          '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+          + "".join(f"<url><loc>{esc(SITE_URL + '/' + p)}</loc></url>\n" for p in pages)
+          + "</urlset>\n")
+    write(os.path.join(SITE, "robots.txt"), f"User-agent: *\nAllow: /\nSitemap: {SITE_URL}/sitemap.xml\n")
     print(f"Site built: {len(rows)} repos listed, {rank} in the ranking, {len(history)} repo pages "
           f"and badges, day {day.isoformat()} saved")
 
