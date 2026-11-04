@@ -1,7 +1,12 @@
 name: Daily update
 on:
   schedule:
-    - cron: "0 14 * * *"   # 14:00 UTC = 6 or 7 a.m. Pacific, after GitHub's star day has closed
+    # GitHub's star day closes at 07:00 or 08:00 UTC (midnight Pacific). Two runs, off the busy top of the
+    # hour: GitHub skipped the 14:00 run on 2026-11-04. The second run is the backup and refreshes "so far".
+    - cron: "17 9,15 * * *"
+  push:                    # a code change goes live at once (the job's own data commits never trigger it)
+    branches: [main]
+    paths: ["truestars.py", ".github/workflows/**"]
   workflow_dispatch:
 permissions:
   contents: write   # commit the day's history file
