@@ -90,13 +90,14 @@ BIG_ORGS = {               # well-known companies and AI labs (GitHub logins, lo
     "huggingface", "cloudflare", "vercel", "vercel-labs", "stripe", "spotify", "netflix", "shopify", "ibm",
     "intel",
 }
-WHY_ORDER = ["hn", "youtube", "x", "release", "wave", "new", "org", "reach"]
-# YouTube and X: looked up once a day for the top repos (social()). The data lives only in the published
-# site/social.json, which the next run reads back: never in data/days, because YouTube's rules let us keep
-# its data for 30 days at most (we keep it SOCIAL_KEEP_DAYS) and git keeps history forever.
+WHY_ORDER = ["hn", "youtube", "x", "bsky", "release", "wave", "new", "org", "reach"]
+# YouTube, X and Bluesky: looked up once a day for the top repos (social()). The data lives only in the
+# published site/social.json, which the next run reads back: never in data/days, because YouTube's rules let
+# us keep its data for 30 days at most (we keep it SOCIAL_KEEP_DAYS), posts can be deleted, and git keeps
+# history forever.
 SOCIAL = os.path.join(DATA, "social.json")
 SOCIAL_URL = "https://truestars.dev/social.json"
-SOCIAL_KINDS = ("youtube", "x")  # reason chips left out of data/days
+SOCIAL_KINDS = ("youtube", "x", "bsky")  # reason chips left out of data/days
 SOCIAL_FRESH_HOURS = 20    # data younger than this is reused, so each repo is looked up once a day
 SOCIAL_KEEP_DAYS = 3       # data older than this is deleted
 YT_TOP = 60                # YouTube: the top repos searched each day (YouTube allows 100 searches a day)
@@ -105,10 +106,14 @@ YT_DAYS = 30               # a YouTube reason: a linking video posted in the las
 YT_MIN_VIEWS = 1000        # ... with this many views
 X_TOP = 50                 # X: the top repos counted each day (one prepaid count each, $0.005)
 X_MIN_POSTS = 20           # an X reason: this many posts linked the repo in the last 7 days (reposts not counted)
+BSKY_TOP = 200             # Bluesky (free, no key): the listed repos with no red flags, best first
+BSKY_MIN_POSTS = 5         # a Bluesky reason: this many posts linked the repo in the last 7 days
 REDDIT_APP = ""            # the Reddit test: "<Google Cloud project id>/<site search app id>", once the owner makes it
-# The Explore page (a preview: not linked from the other pages, hidden from search engines) orders
-# repos by TrueStars Heat, see heat()
-HEAT_FULL = 3000           # stars a day that earn all 60 "stars now" points
+CHART_HN_MIN = 5           # Hacker News posts with this many points are marked on the star charts
+TALK_DAYS = 30             # "Where people talk": Hacker News posts from this many days
+# Explore, the home page, orders repos by TrueStars Heat, see heat()
+HEAT_FULL = 3000           # stars a day that earn all the "stars now" points
+HEAT_MAX = {"stars": 50, "speed": 15, "stay": 20, "climb": 15}  # Heat v2 (owner, 2026-11-05)
 HEAT_CLIMB = {"peak": 15, "rising": 12, "steady": 6, "cooling": 0}
 SHELF_MAX = 15             # repos shown on one Explore shelf ("See all" shows the rest)
 SMALL_REPO = 2000          # "Small and rising": under this many stars
@@ -265,10 +270,11 @@ REPO_FIELDS = """
   watchers { totalCount }
   issues { totalCount }
   pullRequests { totalCount }
-  defaultBranchRef { target { ... on Commit { history { totalCount } } } }
+  defaultBranchRef { target { ... on Commit { history { totalCount } week: history(since: "$since") { totalCount } } } }
   releases(first: 1, orderBy: {field: CREATED_AT, direction: DESC}) {
     nodes { tagName url publishedAt releaseAssets(first: 20) { nodes { name } } }
   }
+  recent: releases(first: 6, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { tagName url publishedAt } }
   owner { login __typename avatarUrl(size: 160)
     ... on User { createdAt followers { totalCount } }
     ... on Organization { createdAt } }
@@ -278,12 +284,14 @@ REPO_FIELDS = """
 def repo_details(names, batch=20):
     """Public facts about each repo and its owner, 20 repos per request."""
     out = {}
+    week_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fields = Template(REPO_FIELDS).substitute(since=week_ago)  # commits in the last 7 days
     for i in range(0, len(names), batch):
         chunk = names[i:i + batch]
         parts = []
         for j, full in enumerate(chunk):
             owner, name = full.split("/", 1)
-            parts.append(f"r{j}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ {REPO_FIELDS} }}")
+            parts.append(f"r{j}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ {fields} }}")
         data = graphql("query { " + " ".join(parts) + " }").get("data") or {}
         for j, full in enumerate(chunk):
             if data.get(f"r{j}"):
@@ -310,6 +318,7 @@ def hacker_news(full_name):
             url = url[4:]
         if url.startswith(prefix) and (url == prefix or url[len(prefix)] in "/?#"):
             stories.append({"title": hit.get("title") or "", "points": hit.get("points") or 0,
+                            "comments": hit.get("num_comments") or 0, "at": hit.get("created_at") or "",
                             "date": (hit.get("created_at") or "")[:10], "id": hit.get("objectID")})
     return sorted(stories, key=lambda s: s["date"], reverse=True)
 
@@ -333,6 +342,8 @@ def api_reason(raw):
         return ""
     if not isinstance(body, dict):
         return ""
+    if isinstance(body.get("error"), str):  # Bluesky: {"error": "InvalidRequest", "message": ...}
+        return body["error"][:60]
     err = body.get("error") if isinstance(body.get("error"), dict) else {}
     codes = [e.get("reason") for e in (err.get("details") or []) + (err.get("errors") or [])
              if isinstance(e, dict) and e.get("reason")]
@@ -386,6 +397,35 @@ def x_posts(full_name, token):
     except (ValueError, TypeError, AttributeError, KeyError):
         return 0, "unreadable answer"
     return 200, {"week": week, "days": days}
+
+
+def bluesky(full_name):
+    """(200, {"week": posts in the last 7 days, "days": [[Pacific day, posts, the most liked one], ...]}):
+    Bluesky posts that link the repo, from Bluesky's public search (free, no key); or (status, reason).
+    The newest 100 posts cover the two weeks the charts show for nearly every repo."""
+    query = urllib.parse.urlencode({"q": "*", "url": f"https://github.com/{full_name}", "sort": "latest",
+                                    "limit": 100})
+    status, raw = fetch("https://api.bsky.app/xrpc/app.bsky.feed.searchPosts?" + query, tries=2)
+    if status != 200:
+        return status, api_reason(raw)
+    now = dt.datetime.now(dt.timezone.utc)
+    week, days = 0, {}
+    try:
+        for post in json.loads(raw).get("posts") or []:
+            at = dt.datetime.fromisoformat(((post.get("record") or {}).get("createdAt") or "").replace("Z", "+00:00"))
+            if at.tzinfo is None or not 0 <= (now - at).days < 15:
+                continue  # a wrong clock, or older than the charts go
+            week += (now - at).days < 7
+            day = at.astimezone(PACIFIC).date().isoformat()
+            score = (post.get("likeCount") or 0) + (post.get("repostCount") or 0)
+            n, best, best_score = days.get(day, (0, None, -1))
+            if score > best_score:  # a link to the most liked post of the day, by its author's stable id
+                best = f"https://bsky.app/profile/{post['author']['did']}/post/{post['uri'].rsplit('/', 1)[1]}"
+                best_score = score
+            days[day] = (n + 1, best, best_score)
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return 0, "unreadable answer"
+    return 200, {"week": week, "days": [[d, n, url] for d, (n, url, _) in sorted(days.items())]}
 
 
 def reddit_threads(full_name, key):
@@ -584,6 +624,7 @@ def assess(repo, latest, frac):
     talk = meta["issues"]["totalCount"] + meta["pullRequests"]["totalCount"]
     target = (meta.get("defaultBranchRef") or {}).get("target") or {}
     commits = (target.get("history") or {}).get("totalCount")
+    commits_week = (target.get("week") or {}).get("totalCount")
     owner = meta["owner"]
     owner_age = days_between(owner["createdAt"], latest) if owner.get("createdAt") else None
     repo_age = days_between(meta["createdAt"], latest)
@@ -650,6 +691,15 @@ def assess(repo, latest, frac):
 
     chart_start = max(start, latest - dt.timedelta(days=89))
     week = day_total(daily, yday, 7)
+    # The star charts mark what happened on each day; build() adds YouTube videos and Bluesky posts
+    events = [{"day": pacific_day(s["at"]).isoformat(), "kind": "hn", "text": f"Hacker News: {s['title'][:120]}",
+               "extra": f"{s['points']:,} points · {s['comments']:,} comments",
+               "url": f"https://news.ycombinator.com/item?id={s['id']}"}
+              for s in repo["hn"] or [] if s.get("at") and s["points"] >= CHART_HN_MIN]
+    events += [{"day": pacific_day(r["publishedAt"]).isoformat(), "kind": "rel", "text": f"Release {r['tagName'][:60]}",
+                "extra": "", "url": r["url"]}
+               for r in ((meta.get("recent") or {}).get("nodes") or []) if r and r.get("publishedAt")]
+    events = [e for e in events if chart_start.isoformat() <= e["day"] <= latest.isoformat()]
     return {
         "slug": slug_of(meta["nameWithOwner"]),
         "name": meta["nameWithOwner"], "url": meta["url"],
@@ -664,7 +714,8 @@ def assess(repo, latest, frac):
         "chart_start": chart_start.isoformat(),
         "chart": [daily.get((chart_start + dt.timedelta(days=k)).isoformat(), 0)
                   for k in range((latest - chart_start).days + 1)],
-        "flags": flags, "notes": notes, "why": why,
+        "flags": flags, "notes": notes, "why": why, "events": events, "commits_week": commits_week,
+        "hn_recent": [s for s in repo["hn"] or [] if s["date"] and days_between(s["date"], latest) <= TALK_DAYS],
         "age": repo_age, "topics": topics,
         "waves": [name for name, tags in WAVES if tags.intersection(topics)],
         "direction": direction(counts, start, created >= first),
@@ -682,34 +733,41 @@ def https_only(url):
 
 
 def heat(row, frac):
-    """TrueStars Heat, 0-100: how hot a repo is right now. Three parts, each rounded:
+    """TrueStars Heat v2, 0-100: how hot a repo is right now, and whether it keeps going. Four parts,
+    each rounded (the maxima are HEAT_MAX):
 
-    stars now (60): stars on the last full day, or today's pace once RISE_FRAC of today has passed;
-      10 a day scores 0, HEAT_FULL a day or more 60, on a log scale (each tenfold step adds the same)
-    speeding up (25): that pace against its mean over the 7 days before; x1 or less 0, x10 or more 25
+    stars now (50): stars on the last full day, or today's pace once RISE_FRAC of today has passed;
+      10 a day scores 0, HEAT_FULL a day or more 50, on a log scale (each tenfold step adds the same)
+    speeding up (15): that pace against its mean over the 7 days before; x1 or less 0, x10 or more 15
+    staying power (20): how much of the last 7 full days' stars came outside the best of them; a one-day
+      spike scores 0, seven even days 20 (the daily.dev article: week after week beats a one-day spike)
     still climbing (15): from its direction, HEAT_CLIMB
-    Returns (heat, [the three parts], pace, times its usual pace).
+    Returns (heat, [the four parts], pace, times its usual pace).
     """
     s = row["spark"]  # 15 days: 14 complete days, then today so far
     pace, base = s[-2], sum(s[-9:-2]) / 7
     if frac >= RISE_FRAC and s[-1] / frac > pace:
         pace, base = s[-1] / frac, sum(s[-8:-1]) / 7
-    stars_now = 60 * min(1.0, max(0.0, (math.log10(max(pace, 1)) - 1) / (math.log10(HEAT_FULL) - 1)))
+    stars_now = HEAT_MAX["stars"] * min(1.0, max(0.0, (math.log10(max(pace, 1)) - 1)
+                                                 / (math.log10(HEAT_FULL) - 1)))
     x = pace / max(base, RISE_FLOOR)
-    speeding = 25 * min(1.0, math.log10(x)) if x > 1 else 0
+    speeding = HEAT_MAX["speed"] * min(1.0, math.log10(x)) if x > 1 else 0
+    week = s[-8:-1]
+    staying = HEAT_MAX["stay"] * min(1.0, (1 - max(week) / sum(week)) * 7 / 6) if sum(week) else 0
     d = row["direction"]
     climbing = HEAT_CLIMB[d["state"]] if d else (HEAT_CLIMB["peak"] if pace else 0)
-    parts = [round(stars_now), round(speeding), climbing]
+    parts = [round(stars_now), round(speeding), round(staying), climbing]
     return sum(parts), parts, round(pace), round(x, 1)
 
 
 # ----------------------------------------------------------------- history
 
-PAGE_ONLY = ("chart", "chart_start", "avatar", "image", "color", "heat_parts", "pace", "speedup", "social")
+PAGE_ONLY = ("chart", "chart_start", "avatar", "image", "color", "heat_parts", "pace", "speedup", "social",
+             "events", "hn_recent")
 
 
 def save_day(day, rows, data):
-    """The day's ranking as published. These files are the site's history: no YouTube or X data."""
+    """The day's ranking as published. These files are the site's history: no YouTube, X or Bluesky data."""
     os.makedirs(DAYS, exist_ok=True)
     snapshot = {"day": day.isoformat(), "generated_at": data["generated_at"],
                 "repos_checked": len(data["repos"]),
@@ -855,6 +913,11 @@ def talk_html(row):
         parts.append(f'<p>X: <b>{posts:,} post{"s" if posts != 1 else ""}</b> linked it in the last 7 days, '
                      f'reposts not counted. <a href="{esc(x_search(row["name"]))}" target="_blank" '
                      f'rel="noopener">See them on X ↗</a></p>')
+    posts = (found.get("bsky") or {}).get("week") or 0
+    if posts:
+        parts.append(f'<p>Bluesky: <b>{posts:,} post{"s" if posts != 1 else ""}</b> linked it in the last 7 days. '
+                     f'<a href="{esc(bsky_search(row["name"]))}" target="_blank" rel="noopener">See them on '
+                     f'Bluesky ↗</a></p>')
     videos = (found.get("youtube") or {}).get("videos") or []
     if videos:
         items = "".join(
@@ -877,9 +940,40 @@ def why_chips(row):
     return "".join(chips)
 
 
-def shell(title, body, root, description, updated, path=None, head=""):
-    # path: the page's address under SITE_URL ("" = home); None = no canonical link (404, Explore)
-    # head: extra tags for <head>
+def icon_svg(paths):
+    return f'<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">{paths}</svg>'
+
+
+# The logo (picked 2026-11-05 from the three in the Explore v2 proposal): a white star on a blue tile, like an
+# app icon. The README badge keeps its own gold star.
+LOGO_STAR = ("12.00,5.30 14.00,9.95 19.04,10.41 15.23,13.75 16.35,18.69 12.00,16.10 7.65,18.69 8.77,13.75 "
+             "4.96,10.41 10.00,9.95")
+LOGO_INNER = ('<defs><linearGradient id="ts-tile" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3c64e6"/>'
+              '<stop offset="1" stop-color="#7b4fe0"/></linearGradient></defs>'
+              '<rect x="1" y="1" width="22" height="22" rx="6.4" fill="url(#ts-tile)"/>'
+              f'<polygon points="{LOGO_STAR}" fill="#fff" stroke="#fff" stroke-width="1.4" stroke-linejoin="round"/>')
+LOGO = f'<svg class="mark" viewBox="0 0 24 24" aria-hidden="true">{LOGO_INNER}</svg>'
+FAVICON = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">{LOGO_INNER}</svg>\n'
+SEARCH_ICON = icon_svg('<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>')
+NAV = [  # (key, label, address under the site root, icon); on phones the same links make the tab bar
+    ("explore", "Explore", "index.html", icon_svg('<circle cx="12" cy="12" r="8.5"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/>')),
+    ("ranking", "Ranking", "ranking/index.html",
+     icon_svg('<path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/>')),
+    ("how", "How it works", "how/index.html", icon_svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/>')),
+]
+
+
+def nav_links(root, current):
+    links = []
+    for key, label, href, icon in NAV:
+        mark = ' aria-current="page"' if key == current else ""
+        links.append(f'<a href="{root}{href}"{mark}>{icon}<span>{label}</span></a>')
+    return "".join(links)
+
+
+def shell(title, body, root, description, updated, path=None, head="", nav=None):
+    # path: the page's address under SITE_URL ("" = home); None = no canonical link (404)
+    # head: extra tags for <head>; nav: the menu item to mark as the current page
     share = ""
     if path is not None:
         url = esc(f"{SITE_URL}/{path}")
@@ -901,14 +995,16 @@ def shell(title, body, root, description, updated, path=None, head=""):
 {head}</head>
 <body>
 <header class="top"><div class="wrap">
-  <a class="logo" href="{root}index.html">{STAR_ICON}TrueStars</a>
-  <nav><a href="{root}index.html">Ranking</a><a href="{root}how/index.html">How it works</a></nav>
+  <a class="logo" href="{root}index.html">{LOGO}TrueStars</a>
+  <nav class="menu" aria-label="Main">{nav_links(root, nav)}</nav>
+  <a class="search-btn" href="{root}index.html#search" data-search aria-label="Search repos">{SEARCH_ICON}</a>
 </div></header>
 <main class="wrap">
 {body}
 </main>
-<footer class="wrap foot">TrueStars · updated {esc(updated)} · data from GitHub's API, GH Archive, Hacker News, YouTube
-  and X · not affiliated with GitHub · <a href="{root}privacy/index.html">Privacy and terms</a></footer>
+<footer class="wrap foot">TrueStars · updated {esc(updated)} · data from GitHub's API, GH Archive, Hacker News, Bluesky,
+  YouTube and X · not affiliated with GitHub · <a href="{root}privacy/index.html">Privacy and terms</a></footer>
+<nav class="tabs" aria-label="Main">{nav_links(root, nav)}</nav>
 </body>
 </html>
 """
@@ -923,11 +1019,7 @@ def star_points(cx, cy, outer, inner):
     return " ".join(pts)
 
 
-STAR_ICON = (f'<svg class="star" viewBox="0 0 20 20" aria-hidden="true">'
-             f'<polygon points="{star_points(10, 10.6, 9.5, 4)}"/></svg>')
-
-
-def render_rising(rising, day):
+def render_rising(rising, day, root):
     """The "Rising now" list at the top of the ranking."""
     items = []
     for r in rising:
@@ -935,7 +1027,7 @@ def render_rising(rising, day):
         how = "brand new" if x["new"] else f"accelerating {fmt_x(x['x'])}"
         when = (f"+{x['stars']:,} so far today" if x["when"] == "today"
                 else f"+{x['stars']:,} on {fmt_day(day.isoformat())}")
-        link = (f'href="r/{esc(r["slug"])}/index.html"' if r["rank"]  # no page yet: not ranked on a full day
+        link = (f'href="{root}r/{esc(r["slug"])}/index.html"' if r["rank"]  # no page yet: not ranked on a full day
                 else f'href="{esc(r["url"])}" target="_blank" rel="noopener"')
         items.append(f'<li><a class="name" {link}>{esc(r["name"])}</a>'
                      f'<span class="accel">{how}</span><span class="when">{when}</span></li>')
@@ -943,20 +1035,21 @@ def render_rising(rising, day):
     return f"""<section class="rising" aria-labelledby="rising-h">
     <h2 id="rising-h">Rising now</h2>
     <p class="hint">Getting at least {RISE_X:g}× their usual daily stars, on {fmt_day(day.isoformat())} or at
-      today's pace so far. Updated twice a day. <a href="how/index.html#rising-now">How it's measured</a></p>
+      today's pace so far. Updated twice a day. <a href="{root}how/index.html#rising-now">How it's measured</a></p>
     {found}
   </section>"""
 
 
 def render_index(rows, rising, day, latest, data, updated):
-    root = ""
+    """The ranking, at /ranking/ since Explore became the home page."""
+    root = "../"
     today_label = fmt_day(latest.isoformat()) + (" so far" if latest >= dt.datetime.now(PACIFIC).date() else "")
     hidden = sum(1 for r in rows if len(r["flags"]) >= HIDE_AT_FLAGS)
     items = []
     for r in rows:
         cls, text = verdict(r)
         reasons = reasons_html(r)
-        name_href = f"r/{r['slug']}/index.html" if r["rank"] else r["url"]
+        name_href = f"{root}r/{r['slug']}/index.html" if r["rank"] else r["url"]
         growth = "new" if r["growth"] is None else f'+{r["growth"]:.0f}%'
         items.append(f"""
 <li class="row" data-yesterday="{r['yesterday']}" data-today="{r['today']}" data-week="{r['week']}"
@@ -988,8 +1081,8 @@ def render_index(rows, rising, day, latest, data, updated):
     from {len(data['repos'])} fast-growing repos. Each shows whether it is rising, at its peak or cooling, and the
     reasons we can see. <b>{hidden}</b> repos with two or more red flags for fake stars are left out of the
     ranking; see them under “Has red flags”. Red flags are hints, not proof.
-    <a href="how/index.html">How it works</a></div>
-  {render_rising(rising, day)}
+    <a href="{root}how/index.html">How it works</a></div>
+  {render_rising(rising, day, root)}
   <div class="controls">
     <span class="label">Rank by</span>
     <div class="seg" id="sort">
@@ -1007,10 +1100,10 @@ def render_index(rows, rising, day, latest, data, updated):
   </div>
   <ol id="list">{''.join(items)}</ol>
   <script>{INDEX_JS}</script>"""
-    write(os.path.join(SITE, "index.html"), shell(
-        "TrueStars: the GitHub repos gaining stars fastest, and why", body, root,
+    write(os.path.join(SITE, "ranking", "index.html"), shell(
+        "Ranking · TrueStars: the GitHub repos gaining stars fastest", body, root,
         "Daily ranking of the GitHub repos gaining stars fastest: whether each is rising or cooling, why it may be "
-        "trending, and a check for fake stars.", updated, path=""))
+        "trending, and a check for fake stars.", updated, path="ranking/", nav="ranking"))
 
 
 INDEX_JS = """
@@ -1066,17 +1159,44 @@ document.querySelectorAll('[data-copy]').forEach(function (b) {
 """
 
 
-def render_repo(slug, entry, fresh, latest, updated):
+def chart_window(row, entry, first, n):
+    """The star chart's reasons and our ranks as day numbers counted from `first`, for n days."""
+    def at(iso):
+        k = (dt.date.fromisoformat(iso) - first).days
+        return k if 0 <= k < n else None
+    events = [[at(e["day"]), e["kind"], e["text"], e["extra"], e["url"]] + ([e["n"]] if "n" in e else [])
+              for e in sorted(row["events"], key=lambda e: (e["day"], e["kind"])) if at(e["day"]) is not None]
+    ranks = {at(d): r for d, r in (entry or {}).get("ranks", []) if at(d) is not None}
+    return events, ranks
+
+
+def render_repo(slug, entry, fresh, latest, frac, updated):
     """One page per repo that has been in the ranking."""
     root = "../../../"
     row = fresh or entry["last"]
     best, best_day = best_rank(entry["ranks"])
     cls, text = verdict(row)
     reasons = reasons_html(row)
+    script = ""
     if fresh:
         values, start = row["chart"], row["chart_start"]
         end_label = fmt_day(latest.isoformat()) + " so far"
         stale = ""
+        # the interactive chart (chart.js) replaces the plain one below when the page's scripts run
+        day0 = dt.date.fromisoformat(start)
+        events, ranks = chart_window(row, entry, day0, len(values))
+        ranges = [[len(values) - 1, "3 months" if len(values) >= 85 else f"{len(values)} days"]]
+        ranges += [[k, label] for k, label in ((14, "2 weeks"), (7, "1 week")) if k < len(values) - 1]
+        blob = json.dumps({"repo": {
+            "name": row["name"], "short": row["name"].split("/", 1)[1], "stars": row["stars"],
+            "days": [(day0 + dt.timedelta(days=k)).isoformat() for k in range(len(values))], "values": values,
+            "today": True, "frac": round(frac, 3), "events": events, "ranks": ranks}, "ranges": ranges},
+            separators=(",", ":")).replace("<", "\\u003c")
+        script = (f'<script type="application/json" id="chart-data">{blob}</script>\n'
+                  f'  <script src="{root}chart.js"></script>\n'
+                  "  <script>(function () { var d = JSON.parse(document.getElementById('chart-data').textContent);\n"
+                  "    if (window.TSChart) TSChart(document.getElementById('chart'), d.repo, "
+                  "{ ranges: d.ranges, title: '' }); })();</script>")
     else:  # last seen on an earlier day: its 14 complete days up to then
         values = row["spark"][:-1]
         start = (dt.date.fromisoformat(entry["last_day"]) - dt.timedelta(days=13)).isoformat()
@@ -1088,7 +1208,8 @@ def render_repo(slug, entry, fresh, latest, updated):
     recent = "".join(f"<li><span>{fmt_day(d)}</span><b>#{r}</b></li>" for d, r in reversed(entry["ranks"][-14:]))
     badge_md = f"[![TrueStars]({SITE_URL}/badge/{slug}.svg)]({SITE_URL}/r/{slug}/)"
     body = f"""
-  <p class="crumbs"><a href="{root}index.html">Ranking</a> › {esc(row['name'])}</p>
+  <p class="crumbs"><a href="{root}index.html">Explore</a> · <a href="{root}ranking/index.html">Ranking</a> ›
+    {esc(row['name'])}</p>
   <div class="repo-head">
     <h1>{esc(row['name'])}</h1>
     <span class="lang">{esc(row['language'])}</span>
@@ -1105,8 +1226,10 @@ def render_repo(slug, entry, fresh, latest, updated):
   {where_it_stands(row, latest) if fresh else ''}
   <section class="card">
     <h2>Stars per day</h2>
+    <div id="chart">
     {chart}
     <p class="axis"><span>{first}</span><span>peak {max(values):,} a day</span><span>{end_label}</span></p>
+    </div>
   </section>
   <section class="card">
     <h2>Fake-star check</h2>
@@ -1129,7 +1252,8 @@ def render_repo(slug, entry, fresh, latest, updated):
     <pre id="md">{esc(badge_md)}</pre>
     <button class="copy" data-copy="md">Copy</button>
   </section>
-  <script>{COPY_JS}</script>"""
+  <script>{COPY_JS}</script>
+  {script}"""
     write(os.path.join(SITE, "r", slug, "index.html"), shell(
         f"{row['name']} on TrueStars", body, root,
         f"{row['name']}: daily stars, whether it is rising or cooling, best rank #{best} and a fake-star check.",
@@ -1178,7 +1302,9 @@ def render_how(updated):
   <h1>How TrueStars works</h1>
   <section class="prose">
     <h2>What it ranks</h2>
-    <p>Every day TrueStars ranks the GitHub repos that gained the most stars the day before. It shows whether
+    <p>Every day TrueStars ranks the GitHub repos that gained the most stars the day before
+      (<a href="{root}ranking/index.html">the ranking</a>) and lays them out to browse on
+      <a href="{root}index.html">Explore</a>. It shows whether
       each one is rising, at its peak or cooling, the reasons it may be trending that we can see, and a check for
       signs that its stars are not real. Days run midnight to midnight US Pacific time, the same days GitHub
       uses.</p>
@@ -1218,6 +1344,7 @@ def render_how(updated):
         repo, with how much its stars jumped after it when the video had more views than the stars that came
         after it;</li>
       <li>{X_MIN_POSTS}+ posts on X that linked the repo in the last 7 days, reposts not counted;</li>
+      <li>{BSKY_MIN_POSTS}+ posts on Bluesky that linked the repo in the last 7 days;</li>
       <li>a release in the last week, shown only when a day after it brought at least {JUMP_X:g} times the repo's
         usual daily stars;</li>
       <li>a <b>wave</b>: {WAVE_MIN} or more repos in the ranking that share a GitHub topic, such as DeepSeek
@@ -1226,9 +1353,29 @@ def render_how(updated):
         ago”);</li>
       <li>an owner that is a well-known company or AI lab, or a person with {FOLLOWERS_MIN:,}+ followers.</li>
     </ul>
-    <p>YouTube and X are checked once a day for the top {YT_TOP} and top {X_TOP} repos, through their official
-      APIs. Stars also come from places we can't see, such as Reddit, Discord and newsletters, so a repo with no
-      reason shown may still have a good one.</p>
+    <p>YouTube and X are checked once a day for the top {YT_TOP} and top {X_TOP} repos, and Bluesky for up to
+      {BSKY_TOP} repos with no red flags, through their official APIs. Stars also come from places we can't see,
+      such as Reddit, Discord and newsletters, so a repo with no reason shown may still have a good one.</p>
+    <p>The star charts on Explore and the repo pages mark these on the day they happened: Hacker News posts with
+      {CHART_HN_MIN}+ points, YouTube videos, releases and days with Bluesky posts. The dashed outline on today's
+      bar is the pace it is on by midnight Pacific.</p>
+    <h2 id="heat">Explore and TrueStars Heat</h2>
+    <p>The home page, Explore, shows the repos with no red flags on shelves (speeding up, just launched, best day
+      yet, waves and more), ordered by TrueStars Heat: our own score, from 0 to 100, of how hot a repo is right now
+      and whether it keeps going. It adds four parts:</p>
+    <ul>
+      <li><b>Stars now, up to {HEAT_MAX["stars"]}.</b> Stars on the last full day, or today's pace once a fifth of
+        the day has passed. 10 a day scores 0 and {HEAT_FULL:,} or more scores {HEAT_MAX["stars"]}; each tenfold
+        step adds the same.</li>
+      <li><b>Speeding up, up to {HEAT_MAX["speed"]}.</b> That pace against its average over the 7 days before. Its
+        usual pace or slower scores 0, ten times or more scores {HEAT_MAX["speed"]}.</li>
+      <li><b>Staying power, up to {HEAT_MAX["stay"]}.</b> How much of the last 7 full days' stars came outside the
+        best of them. A one-day spike scores 0; seven even days score {HEAT_MAX["stay"]}.</li>
+      <li><b>Still climbing, up to {HEAT_CLIMB["peak"]}.</b> At its peak {HEAT_CLIMB["peak"]}, rising
+        {HEAT_CLIMB["rising"]}, steady {HEAT_CLIMB["steady"]}, cooling {HEAT_CLIMB["cooling"]}.</li>
+    </ul>
+    <p>Staying power was added on Nov 5, 2026, after the daily.dev article on spotting rising repos early:
+      growth week after week says more than a one-day spike.</p>
     <h2>The fake-star check</h2>
     <p>GitHub no longer shows who starred a repo, so the check uses what is still public. Real projects usually
       draw forks, watchers and issues along with their stars; bought stars usually come alone. A repo gets a red
@@ -1256,7 +1403,7 @@ def render_how(updated):
     write(os.path.join(SITE, "how", "index.html"), shell(
         "How TrueStars works", body, root,
         "How TrueStars ranks GitHub repos, tells rising from cooling, finds reasons and checks for fake stars.",
-        updated, path="how/"))
+        updated, path="how/", nav="how"))
 
 
 def render_privacy(updated):
@@ -1266,24 +1413,25 @@ def render_privacy(updated):
   <h1>Privacy and terms</h1>
   <section class="prose">
     <p>TrueStars has no accounts, sets no cookies and runs no ads or analytics. It collects nothing about you.
-      The site is hosted on GitHub Pages, and the Explore page loads repo and owner pictures from GitHub. GitHub
+      The site is hosted on GitHub Pages, and Explore, the home page, loads repo and owner pictures from GitHub. GitHub
       may log those visits, as
       <a href="https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement">GitHub's
       privacy statement</a> describes.</p>
-    <h2>YouTube and X</h2>
+    <h2>YouTube, X and Bluesky</h2>
     <p>Repo pages list YouTube videos that link a repo, found through the YouTube API Services, and count the
-      posts on X that link it, through X's API. By using TrueStars you agree to be bound by
+      posts on X and on Bluesky that link it, through X's API and Bluesky's public API. For Bluesky we keep only
+      counts per day and a link to one post. By using TrueStars you agree to be bound by
       <a href="https://www.youtube.com/t/terms">YouTube's Terms of Service</a>. Google's handling of YouTube data
       is covered by the <a href="https://www.google.com/policies/privacy">Google Privacy Policy</a>. TrueStars
-      keeps YouTube and X data for at most {SOCIAL_KEEP_DAYS} days; repos near the top are looked up again every
-      day.</p>
+      keeps YouTube, X and Bluesky data for at most {SOCIAL_KEEP_DAYS} days; repos near the top are looked up again
+      every day.</p>
     <h2>Contact</h2>
     <p>For questions, or to have something removed, open an issue at
       <a href="https://github.com/truestars-dev/truestars/issues">github.com/truestars-dev/truestars</a>.</p>
   </section>"""
     write(os.path.join(SITE, "privacy", "index.html"), shell(
         "Privacy and terms · TrueStars", body, root,
-        "TrueStars collects nothing about you. How it uses YouTube and X data.", updated, path="privacy/"))
+        "TrueStars collects nothing about you. How it uses YouTube, X and Bluesky data.", updated, path="privacy/"))
 
 
 # ----------------------------------------------------------------- explore
@@ -1312,19 +1460,22 @@ def art_of(name, color=""):
             [55 + seed[2] % 36, 6 + seed[3] % 26])
 
 
-def render_explore(rows, day, latest, generated, updated):
-    """Explore: an App Store-style page for browsing the repos with no red flags, by TrueStars Heat.
-    The page is drawn in the browser from the JSON below (EXPLORE_JS)."""
+def render_explore(rows, day, latest, generated, frac, history, updated):
+    """Explore, the home page: an App Store-style page for browsing the repos with no red flags, by
+    TrueStars Heat. The page is drawn in the browser from the JSON below (EXPLORE_JS)."""
     pool = sorted((r for r in rows if not r["flags"] and r["heat"] > 0),
                   key=lambda r: (-r["heat"], -r["pace"], r["name"].lower()))
     if not pool:
         return
+    root = ""
     day_label = fmt_day(day.isoformat())
+    first = latest - dt.timedelta(days=14)  # the quick look's chart: 14 full days and today
     repos = []
     for r in pool:
         colors, orb = art_of(r["name"], r["color"])
         d = r["direction"]
         label, detail = dir_parts(d) if d else (None, "")
+        events, ranks = chart_window(r, history.get(r["slug"]), first, 15)
         repos.append({
             "slug": r["slug"], "name": r["name"], "desc": r["description"][:200], "lang": r["language"],
             "url": r["url"], "page": os.path.exists(os.path.join(SITE, "r", r["slug"], "index.html")),
@@ -1334,7 +1485,8 @@ def render_explore(rows, day, latest, generated, updated):
             "speedup": r["speedup"], "state": d["state"] if d else None, "dir": label, "dir_detail": detail,
             # the wave chip's count is the ranking's; here the wave card counts the repos on this page
             "why": [[w["text"].split(" · ")[0] if w["kind"] == "wave" else w["text"], w["url"]] for w in r["why"]],
-            "topics": r["topics"],
+            "topics": r["topics"], "events": events, "ranks": ranks, "talk": talk_of(r),
+            "commits": r["commits_week"],
         })
 
     def state(r):
@@ -1386,8 +1538,9 @@ def render_explore(rows, day, latest, generated, updated):
     fresh = next((i for i, r in enumerate(pool) if i and r["age"] <= 14), None)
     fast = next((i for i in next((f["items"] for f in filters if f["id"] == "speeding"), [])
                  if i and i != fresh), None)
-    data = {"day": day_label, "today": fmt_day(latest.isoformat()) + " so far",
-            "spark_days": [fmt_day((day - dt.timedelta(days=k)).isoformat()) for k in range(13, -1, -1)],
+    data = {"day": day_label, "root": root, "frac": round(frac, 3),
+            "days": [(first + dt.timedelta(days=k)).isoformat() for k in range(15)],
+            "heat_max": [HEAT_MAX[k] for k in ("stars", "speed", "stay")] + [HEAT_CLIMB["peak"]],
             "shelf_max": SHELF_MAX, "fresh": fresh, "fast": fast, "filters": filters,
             "blocks": [b for b in blocks if b], "repos": repos}
     blob = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")  # ASCII; no "</script>" inside
@@ -1395,10 +1548,11 @@ def render_explore(rows, day, latest, generated, updated):
     body = f"""
 <div class="ex">
   <header class="ex-head">
-    <p class="eyebrow">{esc(when)} · Preview</p>
-    <h1>Explore</h1>
-    <p class="ex-lede">{len(pool)} fast-growing GitHub repos with no red flags, picked and ordered by TrueStars
-      Heat: our own score of how hot a repo is right now. <a href="#heat">What is Heat?</a></p>
+    <p class="eyebrow">{esc(when)}</p>
+    <h1>Explore GitHub's rising repos</h1>
+    <p class="ex-lede">{len(pool)} fast-growing repos with no red flags for fake stars, ordered by TrueStars Heat:
+      our own score of how hot a repo is right now and whether it keeps going. Updated twice a day.
+      <a href="#heat">What is Heat?</a> · <a href="{root}ranking/index.html">The full ranking</a></p>
   </header>
   <div class="ex-bar" id="bar">
     <input id="q" type="search" placeholder="Search repos, topics, languages" aria-label="Search repos"
@@ -1407,20 +1561,24 @@ def render_explore(rows, day, latest, generated, updated):
   </div>
   <div id="home"><div class="ex-today" id="today"></div><div id="blocks"></div></div>
   <section id="grid" hidden></section>
-  <noscript><p>Explore needs JavaScript. <a href="../index.html">See the ranking</a>.</p></noscript>
+  <noscript><p>Explore needs JavaScript. <a href="{root}ranking/index.html">See the ranking</a>.</p></noscript>
   <section class="ex-about" id="heat" aria-labelledby="heat-h">
     <h2 id="heat-h">What is TrueStars Heat?</h2>
-    <p>Our own score, from 0 to 100, of how hot a repo is right now. It adds three parts:</p>
+    <p>Our own score, from 0 to 100, of how hot a repo is right now and whether it keeps going. It adds four
+      parts:</p>
     <ul>
-      <li><b>Stars now, up to 60.</b> Its stars on {day_label}, or today's pace once a fifth of the day has
-        passed. 10 stars a day scores 0 and {HEAT_FULL:,} or more scores 60; each tenfold step adds the same.</li>
-      <li><b>Speeding up, up to 25.</b> That pace against its usual: its average over the 7 days before. Its
-        usual pace or slower scores 0, ten times or more scores 25.</li>
-      <li><b>Still climbing, up to 15.</b> At its peak {HEAT_CLIMB['peak']}, rising {HEAT_CLIMB['rising']},
-        steady {HEAT_CLIMB['steady']}, cooling {HEAT_CLIMB['cooling']}.</li>
+      <li><b>Stars now, up to {HEAT_MAX['stars']}.</b> Its stars on {day_label}, or today's pace once a fifth of
+        the day has passed. 10 stars a day scores 0 and {HEAT_FULL:,} or more scores {HEAT_MAX['stars']}; each
+        tenfold step adds the same.</li>
+      <li><b>Speeding up, up to {HEAT_MAX['speed']}.</b> That pace against its usual: its average over the 7 days
+        before. Its usual pace or slower scores 0, ten times or more scores {HEAT_MAX['speed']}.</li>
+      <li><b>Staying power, up to {HEAT_MAX['stay']}.</b> How much of the last 7 full days' stars came outside the
+        best of them. A one-day spike scores 0; seven even days score {HEAT_MAX['stay']}.</li>
+      <li><b>Still climbing, up to {HEAT_CLIMB['peak']}.</b> At its peak {HEAT_CLIMB['peak']}, rising
+        {HEAT_CLIMB['rising']}, steady {HEAT_CLIMB['steady']}, cooling {HEAT_CLIMB['cooling']}.</li>
     </ul>
     <p>Only repos with no red flags for fake stars are on this page. Days are US Pacific time.
-      <a href="../how/index.html">How TrueStars works</a></p>
+      <a href="{root}how/index.html#heat">How TrueStars works</a></p>
   </section>
 </div>
 <button class="ex-surprise" id="surprise" type="button" hidden><svg viewBox="0 0 16 16" aria-hidden="true">
@@ -1429,18 +1587,20 @@ def render_explore(rows, day, latest, generated, updated):
   </svg>Surprise me</button>
 <dialog class="ex-sheet" id="sheet" aria-labelledby="sheet-name"></dialog>
 <script type="application/json" id="explore-data">{blob}</script>
+<script src="{root}chart.js"></script>
 <script>{EXPLORE_JS}</script>"""
-    write(os.path.join(SITE, "explore", "index.html"), shell(
-        "Explore · TrueStars", body, "../",
-        "Browse today's fast-growing GitHub repos by TrueStars Heat: shelves, waves and surprises.", updated,
-        head=f'<meta name="robots" content="noindex">\n<style>{EXPLORE_CSS}</style>\n'))
+    write(os.path.join(SITE, "index.html"), shell(
+        "TrueStars: the GitHub repos rising fastest, and why", body, root,
+        "Explore today's fast-growing GitHub repos, ordered by TrueStars Heat: what is rising now, why, and whether "
+        "it keeps going. Every repo is checked for fake stars.", updated, path="", nav="explore",
+        head=f"<style>{EXPLORE_CSS}</style>\n"))
 
 
 EXPLORE_JS = r"""
 (function () {
   'use strict';
   var D = JSON.parse(document.getElementById('explore-data').textContent);
-  var R = D.repos, NS = 'http://www.w3.org/2000/svg', byId = {};
+  var R = D.repos, NS = 'http://www.w3.org/2000/svg', byId = {}, ROOT = D.root;
   D.filters.forEach(function (f) { byId[f.id] = f; });
   var hay = R.map(function (r) { return [r.name, r.desc, r.lang].concat(r.topics).join(' ').toLowerCase(); });
   var sheet = document.getElementById('sheet');
@@ -1538,7 +1698,7 @@ EXPLORE_JS = r"""
 
   // A link to the repo's TrueStars page (GitHub when it has none); a plain click opens the quick look
   function opens(a, r) {
-    a.href = r.page ? '../r/' + r.slug + '/index.html' : r.url;
+    a.href = r.page ? ROOT + 'r/' + r.slug + '/index.html' : r.url;
     if (!r.page) { a.target = '_blank'; a.rel = 'noopener'; }
     a.addEventListener('click', function (e) {
       if (e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || !sheet.showModal) return;
@@ -1592,11 +1752,15 @@ EXPLORE_JS = r"""
     big.appendChild(el('span', 'parts-of', '/100'));
     head.appendChild(big);
     box.appendChild(head);
-    var x = r.speedup >= 10 ? Math.round(r.speedup) : r.speedup;
-    [['Stars now', r.parts[0], 60, fmt(r.pace) + ' a day'],
-     ['Speeding up', r.parts[1], 25, r.age <= 7 ? 'new this week' : x >= 1.1 ? '×' + x + ' its usual' :
+    var x = r.speedup >= 10 ? Math.round(r.speedup) : r.speedup, M = D.heat_max;
+    var week = r.spark.slice(-7), sum = week.reduce(function (a, b) { return a + b; }, 0);
+    var best = Math.max.apply(null, week), share = sum ? Math.round(100 * best / sum) : 0;
+    [['Stars now', r.parts[0], M[0], fmt(r.pace) + ' a day'],
+     ['Speeding up', r.parts[1], M[1], r.age <= 7 ? 'new this week' : x >= 1.1 ? '×' + x + ' its usual' :
        x <= 0.9 ? 'slower than its usual' : 'its usual pace'],
-     ['Still climbing', r.parts[2], 15, r.dir || 'new today']].forEach(function (p) {
+     ['Staying power', r.parts[2], M[2], !sum ? 'no full day yet' : share >= 99 ? 'all on one day' :
+       'best day ' + share + '% of the week'],
+     ['Still climbing', r.parts[3], M[3], r.dir || 'new today']].forEach(function (p) {
       var row = el('div', 'part');
       row.appendChild(el('span', 'part-name', p[0]));
       row.appendChild(meter(p[1], p[2], p[0] + ': ' + p[1] + ' of ' + p[2]));
@@ -1607,56 +1771,28 @@ EXPLORE_JS = r"""
     return box;
   }
 
-  // Stars per day in the quick look: 14 full days and today so far, a tooltip on hover or touch,
-  // and the same numbers in a table
-  function chart(r) {
-    var v = r.spark.concat([r.today]), days = D.spark_days.concat([D.today]);
-    var n = v.length, W = 600, H = 120, gap = 4, bw = (W - gap * (n - 1)) / n;
-    var max = Math.max.apply(null, v) || 1;
-    var box = el('div', 'sheet-chart'), plot = el('div', 'plot'), tip = el('span', 'tip');
-    box.appendChild(el('h3', null, 'Stars per day'));
-    var s = sv('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img',
-                        'aria-label': 'Stars per day from ' + days[0] + ' to ' + days[n - 1] + ', in the table below' });
-    tip.hidden = true;
-    v.forEach(function (y, i) {
-      var x = i * (bw + gap), h = y ? Math.max(3, y / max * (H - 2)) : 2, k = Math.min(4, bw / 2, h), top = H - h;
-      var g = sv('g', { 'class': 'col' });
-      g.appendChild(sv('rect', { x: x - gap / 2, y: 0, width: bw + gap, height: H, 'class': 'hit' }));
-      g.appendChild(sv('path', { 'class': i === n - 1 ? 'b-today' : y ? 'b' : 'b-zero',
-        d: 'M' + x + ' ' + H + 'V' + (top + k) + 'Q' + x + ' ' + top + ' ' + (x + k) + ' ' + top + 'H' + (x + bw - k) +
-           'Q' + (x + bw) + ' ' + top + ' ' + (x + bw) + ' ' + (top + k) + 'V' + H + 'Z' }));
-      g.addEventListener('pointerenter', function () {
-        tip.textContent = days[i] + ': ' + plus(y) + ' star' + (y === 1 ? '' : 's');
-        tip.hidden = false;
-        var pw = plot.clientWidth, tw = tip.offsetWidth, px = pw * (x + bw / 2) / W;
-        tip.style.left = Math.max(tw / 2, Math.min(pw - tw / 2, px)) + 'px';
-        s.classList.add('hovering');
-        g.classList.add('on');
-      });
-      g.addEventListener('pointerleave', function () {
-        tip.hidden = true;
-        s.classList.remove('hovering');
-        g.classList.remove('on');
-      });
-      s.appendChild(g);
+  // The quick look's star chart (chart.js): 14 full days and today, the reasons on their days, and any of
+  // the 40 hottest repos laid over it
+  function chartData(r) {
+    return { name: r.name, short: short(r), stars: r.stars, days: D.days, values: r.spark.concat([r.today]),
+             today: true, frac: D.frac, events: r.events || [], ranks: r.ranks || {} };
+  }
+  function compareFor(r) {
+    return byId.hot.items.map(function (i) { return R[i]; }).filter(function (c) { return c !== r; })
+      .slice(0, 40).map(chartData);
+  }
+  function talk(r) {
+    if (!r.talk || !r.talk.length) return null;
+    var box = el('div', 'talk'), ul = el('ul', 'talk-list');
+    box.appendChild(el('h3', null, 'Where people talk about it'));
+    r.talk.forEach(function (t) {
+      var li = el('li'), a = el('a', 'talk-' + t[0], t[1]);
+      a.href = t[2]; a.target = '_blank'; a.rel = 'noopener';
+      li.appendChild(a);
+      ul.appendChild(li);
     });
-    plot.appendChild(s);
-    plot.appendChild(tip);
-    box.appendChild(plot);
-    var axis = el('div', 'axis');
-    axis.appendChild(el('span', null, days[0]));
-    axis.appendChild(el('span', null, days[n - 1]));
-    box.appendChild(axis);
-    var det = el('details', 'numbers'), table = el('table');
-    det.appendChild(el('summary', null, 'Day by day'));
-    v.forEach(function (y, i) {
-      var tr = el('tr');
-      tr.appendChild(el('td', null, days[i]));
-      tr.appendChild(el('td', null, plus(y)));
-      table.appendChild(tr);
-    });
-    det.appendChild(table);
-    box.appendChild(det);
+    box.appendChild(ul);
+    if (r.talk.length > 1) box.appendChild(el('p', 'talk-many', 'Talked about in ' + r.talk.length + ' places'));
     return box;
   }
 
@@ -1687,21 +1823,26 @@ EXPLORE_JS = r"""
     h.id = 'sheet-name';
     head.appendChild(icon(r, 'icon-lg'));
     t.appendChild(h);
+    var ship = r.commits === null || r.commits === undefined ? '' : r.commits ?
+      fmt(r.commits) + ' commit' + (r.commits === 1 ? '' : 's') + ' this week' : 'no commits this week';
     t.appendChild(el('p', 'tile-sub', [owner(r), r.lang, fmt(r.stars) + ' stars',
-      r.age <= 30 ? 'created ' + (r.age ? r.age + ' day' + (r.age === 1 ? '' : 's') + ' ago' : 'today') : '']
+      r.age <= 30 ? 'created ' + (r.age ? r.age + ' day' + (r.age === 1 ? '' : 's') + ' ago' : 'today') : '', ship]
       .filter(Boolean).join(' · ')));
     head.appendChild(t);
     body.appendChild(head);
     if (r.desc) body.appendChild(el('p', 'sheet-desc', r.desc));
     body.appendChild(chips(r));
     body.appendChild(heatParts(r));
-    body.appendChild(chart(r));
+    var plot = el('div', 'sheet-chart');
+    body.appendChild(plot);
+    var said = talk(r);
+    if (said) body.appendChild(said);
     var acts = el('div', 'sheet-actions'), gh = el('a', 'btn btn-main', 'Open on GitHub ↗');
     gh.href = r.url; gh.target = '_blank'; gh.rel = 'noopener';
     acts.appendChild(gh);
     if (r.page) {
       var p = el('a', 'btn', 'TrueStars page');
-      p.href = '../r/' + r.slug + '/index.html';
+      p.href = ROOT + 'r/' + r.slug + '/index.html';
       acts.appendChild(p);
     }
     if (lucky) {
@@ -1713,6 +1854,7 @@ EXPLORE_JS = r"""
     body.appendChild(acts);
     sheet.appendChild(body);
     if (!sheet.open) sheet.showModal();
+    if (window.TSChart) TSChart(plot, chartData(r), { ranges: [[14, '2 weeks'], [7, '1 week']], compare: compareFor(r) });
     sheet.scrollTop = 0;
     close.focus();
     try { history.replaceState(null, '', '#' + r.slug); } catch (e) { /* file:// */ }
@@ -1894,7 +2036,14 @@ EXPLORE_JS = r"""
   var lucky = document.getElementById('surprise');
   lucky.hidden = !sheet.showModal;
   lucky.addEventListener('click', function () { show(surprise(null), true); });
-  var start = decodeURIComponent(location.hash.slice(1));
+  // The menu's search button (on every page it opens this one at #search)
+  function toSearch(e) {
+    if (e) e.preventDefault();
+    q.focus();
+  }
+  document.querySelectorAll('[data-search]').forEach(function (a) { a.addEventListener('click', toSearch); });
+  var start = decodeURIComponent(location.hash.slice(1)).toLowerCase();
+  if (start === 'search') toSearch();
   R.forEach(function (r) { if (r.slug === start && sheet.showModal) show(r, false); });
 })();
 """
@@ -1913,7 +2062,7 @@ main.wrap { padding-bottom: 96px; }
   color: var(--muted); margin: 0 0 4px; }
 .ex-head h1 { font-size: 34px; margin: 0 0 6px; }
 .ex-lede { margin: 0; color: var(--muted); max-width: 680px; }
-.ex-bar { position: sticky; top: 0; z-index: 5; display: flex; gap: 10px; align-items: center;
+.ex-bar { position: sticky; top: 57px; z-index: 5; display: flex; gap: 10px; align-items: center;
   margin: 10px -16px 14px; padding: 10px 16px; background: var(--bar-bg);
   -webkit-backdrop-filter: saturate(1.4) blur(10px); backdrop-filter: saturate(1.4) blur(10px); }
 .ex-bar input { order: 2; flex: 0 0 250px; min-width: 0; font: inherit; font-size: 14px; padding: 7px 14px;
@@ -2071,20 +2220,13 @@ main.wrap { padding-bottom: 96px; }
 .part-pts { font-weight: 650; text-align: right; font-variant-numeric: tabular-nums; }
 .part-why { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sheet-chart { margin-top: 16px; }
-.sheet-chart h3 { font-size: 14px; margin: 0 0 8px; }
-.plot { position: relative; }
-.plot svg { display: block; width: 100%; height: auto; }
-.plot .hit { fill: transparent; }
-.plot .b { fill: var(--bar); } .plot .b-today { fill: var(--bar-today); } .plot .b-zero { fill: var(--bar-zero); }
-.plot svg.hovering .col:not(.on) path { opacity: 0.45; }
-.tip { position: absolute; top: -4px; transform: translate(-50%, -100%); padding: 4px 8px; border-radius: 6px;
-  background: var(--ink); color: var(--bg); font-size: 12px; font-weight: 600; white-space: nowrap; pointer-events: none; }
-.tip[hidden] { display: none; }
-.numbers { margin-top: 10px; font-size: 13px; }
-.numbers summary { cursor: pointer; color: var(--accent); }
-.numbers table { margin-top: 6px; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-.numbers td { padding: 2px 18px 2px 0; }
-.numbers td + td { text-align: right; }
+.talk { margin-top: 16px; }
+.talk h3 { margin: 0 0 8px; font-size: 14px; }
+.talk-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.talk-list a { display: inline-flex; padding: 5px 12px; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--ink); font-size: 13px; text-decoration: none; }
+.talk-list a:hover { border-color: var(--muted); }
+.talk-many { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
 .sheet-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
 .btn { display: inline-flex; align-items: center; padding: 9px 16px; border: 1px solid var(--line); border-radius: 999px;
   background: var(--panel); color: var(--ink); font: inherit; font-size: 14px; font-weight: 650; text-decoration: none;
@@ -2094,7 +2236,8 @@ main.wrap { padding-bottom: 96px; }
 @media (hover: none) { .nav-btn { display: none; } }
 @media (max-width: 760px) {
   .ex-head h1 { font-size: 28px; }
-  .ex-bar { flex-wrap: wrap; }
+  .ex-bar { top: 0; flex-wrap: wrap; }
+  .ex-surprise { bottom: calc(74px + env(safe-area-inset-bottom, 0px)); }
   .ex-bar input { order: 0; flex: 1 1 100%; }
   .feature { grid-template-columns: 1fr; border-radius: 16px; }
   .feature .art { min-height: 0; aspect-ratio: 2 / 1; }
@@ -2118,6 +2261,423 @@ main.wrap { padding-bottom: 96px; }
   .sheet-body { padding: 14px 14px 18px; }
 }
 """
+
+
+# The star chart on Explore's quick look and the repo pages (site/chart.js): stars per day with the reasons
+# on the days they happened, today's pace by midnight, the usual week, total stars and our rank that day,
+# and a second repo laid over it. TSChart(box, repo, {ranges: [[days back, label], ...], compare: [repo, ...],
+# title}) where repo = {name, short, stars, days: [ISO dates], values: [stars per day], today: the last value is
+# today so far, frac: the share of today gone, events: [[day, kind, text, extra, url, posts]], ranks: {day: rank}}
+CHART_JS = r"""
+(function () {
+  'use strict';
+  var NS = 'http://www.w3.org/2000/svg', uid = 0;
+  var KIND = { hn: 'Hacker News', yt: 'YouTube', rel: 'Release', bsky: 'Bluesky' };
+  var ORDER = { hn: 0, yt: 1, rel: 2, bsky: 3 };
+  var GLYPH = {  // Y for Hacker News (text), a play button for YouTube, a tag for releases, a butterfly for Bluesky
+    yt: 'M-3.3,-4.6 L4.9,0 L-3.3,4.6 Z',
+    rel: 'M-5,-5.2 h5 l5.4,5.2 l-5.2,5.2 l-5.2,-5.2 z',
+    bsky: 'M0,1.2 C-1.6,-2.2 -5.6,-4.6 -5.8,-1.6 C-5.9,0.8 -3.4,2 -1.5,1.9 C-3.6,2.6 -4,5.4 -1.4,5 C-0.5,4.8 0,3.6 ' +
+          '0,3 C0,3.6 0.5,4.8 1.4,5 C4,5.4 3.6,2.6 1.5,1.9 C3.4,2 5.9,0.8 5.8,-1.6 C5.6,-4.6 1.6,-2.2 0,1.2 Z'
+  };
+  var MON = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' '), WD = 'Sun Mon Tue Wed Thu Fri Sat'.split(' ');
+  function when(iso) { return new Date(iso + 'T12:00:00Z'); }
+  function label(iso) { var d = when(iso); return MON[d.getUTCMonth()] + ' ' + d.getUTCDate(); }
+  function weekday(iso) { return WD[when(iso).getUTCDay()]; }
+  function fmt(n) { return Math.round(n).toLocaleString('en-US'); }
+  function short(n) { return n >= 10000 ? (Math.round(n / 100) / 10).toString().replace(/\.0$/, '') + 'k' : fmt(n); }
+  function times(x) { return x >= 10 ? String(Math.round(x)) : x.toFixed(1).replace(/\.0$/, ''); }
+  function add(a, b) { return a + b; }
+  function sv(tag, attrs, parent) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  function link(text, url) {
+    if (!url) return document.createTextNode(text);
+    var a = el('a', null, text);
+    a.href = url; a.target = '_blank'; a.rel = 'noopener';
+    return a;
+  }
+  function glyph(g, k) {
+    sv('circle', { r: 10 }, g);
+    if (k === 'hn') sv('text', { 'class': 'gt', 'text-anchor': 'middle', y: 4 }, g).textContent = 'Y';
+    else sv('path', { d: GLYPH[k], 'class': 'g', transform: k === 'rel' ? 'translate(0.4,0)' : '' }, g);
+  }
+  function badge(k) {
+    var b = el('span', 'tsc-kind');
+    if (k === 'hn') b.textContent = 'Y';
+    else {
+      var s = sv('svg', { viewBox: '-7 -7 14 14', 'aria-hidden': 'true' });
+      sv('path', { d: GLYPH[k] }, s);
+      b.appendChild(s);
+    }
+    b.title = KIND[k];
+    return b;
+  }
+  function topRounded(x, y, w, h) {  // a bar with rounded top corners, anchored to the baseline
+    if (h <= 0.4) return '';
+    var r = Math.min(4, w / 2, h);
+    return 'M' + x + ',' + (y + h) + 'V' + (y + r) + 'Q' + x + ',' + y + ' ' + (x + r) + ',' + y + 'H' + (x + w - r) +
+           'Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) + 'V' + (y + h) + 'Z';
+  }
+  function nice(max) {
+    if (max <= 0) return { top: 10, step: 5 };
+    var raw = max / 3, p = Math.pow(10, Math.floor(Math.log10(raw)));
+    var step = Math.max(1, [1, 2, 2.5, 5, 10].filter(function (m) { return m * p >= raw; })[0] * p);
+    return { top: Math.ceil(max / step) * step, step: step };
+  }
+
+  window.TSChart = function (box, R, opts) {
+    opts = opts || {};
+    var ALL = R.values.length, id = ++uid, events = (R.events || []).map(function (e) {
+      return { i: e[0], k: e[1], t: e[2], x: e[3], u: e[4], n: e[5] || 1 };
+    });
+    var lastFull = R.today ? ALL - 2 : ALL - 1;
+    var proj = R.today && R.frac >= 0.2 ? Math.round(R.values[ALL - 1] / R.frac) : null;
+    var usual = lastFull >= 7 ? R.values.slice(lastFull - 7, lastFull).reduce(add, 0) / 7 : null;
+    var tot = R.values.map(function () { return 0; }), acc = R.stars;  // total stars at each day's end
+    for (var k = ALL - 1; k >= 0; k--) { tot[k] = Math.max(0, acc); acc -= R.values[k]; }
+    var ranges = (opts.ranges || []).filter(function (r) { return r[0] < ALL; });
+    if (!ranges.length) ranges = [[ALL - 1, '']];
+    var S = { range: ranges[0][0], cmp: null, sel: null, pinned: false, g: null };
+
+    box.textContent = '';
+    box.classList.add('tsc');
+    var top = el('div', 'tsc-top'), titles = el('div', 'tsc-titles'), sum = el('p', 'tsc-sum');
+    if (opts.title !== '') titles.appendChild(el('h3', null, opts.title || 'Stars per day'));
+    titles.appendChild(sum);
+    top.appendChild(titles);
+    var ctrl = el('div', 'tsc-ctrl');
+    if (ranges.length > 1) {
+      var seg = el('div', 'tsc-seg');
+      seg.setAttribute('role', 'group');
+      seg.setAttribute('aria-label', 'Days shown');
+      ranges.forEach(function (r) {
+        var b = el('button', null, r[1]);
+        b.type = 'button';
+        b.setAttribute('aria-pressed', String(r[0] === S.range));
+        b.addEventListener('click', function () {
+          S.range = r[0]; S.sel = null; S.pinned = false;
+          seg.querySelectorAll('button').forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+          render();
+        });
+        seg.appendChild(b);
+      });
+      ctrl.appendChild(seg);
+    }
+    if (opts.compare && opts.compare.length) {
+      var lab = el('label', 'tsc-cmp', 'Compare with '), pick = el('select'), none = el('option', null, 'pick a repo');
+      none.value = '';
+      pick.appendChild(none);
+      opts.compare.forEach(function (c, j) { var o = el('option', null, c.short); o.value = String(j); pick.appendChild(o); });
+      pick.addEventListener('change', function () { S.cmp = pick.value === '' ? null : opts.compare[+pick.value]; render(); });
+      lab.appendChild(pick);
+      ctrl.appendChild(lab);
+    }
+    if (ctrl.children.length) top.appendChild(ctrl);
+    box.appendChild(top);
+    var legend = el('div', 'tsc-legend');
+    box.appendChild(legend);
+    var wrap = el('div', 'tsc-wrap'), svg = sv('svg', { 'class': 'tsc-plot', role: 'img' }), tip = el('div', 'tsc-tip');
+    wrap.tabIndex = 0;
+    wrap.setAttribute('aria-label', 'Stars per day. The left and right arrow keys step through the days.');
+    tip.hidden = true;
+    wrap.appendChild(svg);
+    wrap.appendChild(tip);
+    box.appendChild(wrap);
+    box.appendChild(el('p', 'tsc-hint', 'Hover or tap a day to see it; tap it again to let go.' + (proj ?
+      " The dashed outline on today's bar is the pace it is on by midnight Pacific." : '')));
+    var why = el('ul', 'tsc-why');
+    box.appendChild(why);
+    var det = el('details', 'tsc-days'), tw = el('div', 'tsc-table'), table = el('table');
+    det.appendChild(el('summary', null, 'Day by day'));
+    tw.appendChild(table);
+    det.appendChild(tw);
+    box.appendChild(det);
+
+    function cmpValues(c) {  // the other repo's stars on our days
+      var at = {};
+      c.days.forEach(function (d, j) { at[d] = c.values[j]; });
+      return R.days.map(function (d) { return at[d] === undefined ? null : at[d]; });
+    }
+    function summary(s0) {
+      var bi = -1;
+      for (var i = s0; i <= lastFull; i++) if (bi < 0 || R.values[i] > R.values[bi]) bi = i;
+      if (bi < 0 || !R.values[bi]) return R.today ? fmt(R.values[ALL - 1]) + ' stars so far today.' : 'No stars in these days.';
+      var t = 'Best day ' + label(R.days[bi]) + ': ' + fmt(R.values[bi]) + ' star' + (R.values[bi] === 1 ? '' : 's');
+      if (bi >= 7) {
+        var u = R.values.slice(bi - 7, bi).reduce(add, 0) / 7;
+        if (u >= 5 && R.values[bi] / u >= 2) t += ', ' + times(R.values[bi] / u) + ' times its usual week';
+      }
+      var near = events.filter(function (e) { return (e.i === bi || e.i === bi - 1) && e.k !== 'bsky'; })
+        .sort(function (a, b) { return ORDER[a.k] - ORDER[b.k] || b.i - a.i; });
+      if (near.length) {
+        var e = near[0], what = e.k === 'hn' ? 'its Hacker News post' : e.k === 'yt' ? 'a YouTube video' :
+          'release ' + e.t.replace(/^Release /, '');
+        t += ', ' + (e.i === bi ? 'the day of ' : 'a day after ') + what;
+      }
+      return t + '.';
+    }
+    function legendDraw() {
+      legend.textContent = '';
+      function item(cls, text) {
+        var s = el('span');
+        s.appendChild(el('i', 'sw ' + cls));
+        s.appendChild(document.createTextNode(text));
+        legend.appendChild(s);
+      }
+      item('', 'Stars per day' + (S.cmp ? ', ' + R.short : ''));
+      if (R.today) item('hatch', 'Today so far');
+      if (usual !== null && usual >= 1) item('dash', 'Usual week');
+      if (S.cmp) item('line', S.cmp.short);
+    }
+    function draw() {
+      var n = Math.min(ALL, S.range + 1), s0 = ALL - n;
+      var v = R.values.slice(s0), tv = tot.slice(s0), days = R.days.slice(s0);
+      var cv = S.cmp ? cmpValues(S.cmp).slice(s0) : null, li = lastFull - s0;
+      var W = Math.max(300, Math.round(wrap.clientWidth || 0)), narrow = W < 520;
+      var padL = narrow ? 38 : 46, padR = narrow ? 6 : 12, top = 30, H1 = narrow ? 170 : 220, H2 = narrow ? 62 : 78;
+      var yBase = top + H1, laneY = yBase + 16, xlY = laneY + 28, p2top = xlY + 36, p2bot = p2top + H2, Ht = p2bot + 10;
+      var band = (W - padL - padR) / n, bw = Math.min(30, Math.max(band * 0.62, Math.min(5, band - 1)));
+      function cx(i) { return padL + band * (i + 0.5); }
+      var high = v.slice(0, li + 1).concat([v[n - 1], proj || 0]);
+      if (cv) high = high.concat(cv.slice(0, li + 1).filter(function (x) { return x !== null; }));
+      var yt = nice(Math.max.apply(null, high));
+      function y(val) { return yBase - (val / yt.top) * H1; }
+      svg.textContent = '';
+      svg.setAttribute('viewBox', '0 0 ' + W + ' ' + Ht);
+      svg.setAttribute('aria-label', 'Stars per day for ' + R.name + ' from ' + label(days[0]) + ' to ' +
+                       label(days[n - 1]) + '. The numbers are in the Day by day table.');
+      var pat = sv('pattern', { id: 'tsc-hatch-' + id, patternUnits: 'userSpaceOnUse', width: 5, height: 5,
+                                patternTransform: 'rotate(45)' }, sv('defs', {}, svg));
+      sv('rect', { width: 2, height: 5, 'class': 'hatch' }, pat);
+      for (var t = 0; t <= yt.top + 1e-9; t += yt.step) {
+        sv('line', { x1: padL, x2: W - padR, y1: y(t), y2: y(t), 'class': t === 0 ? 'base' : 'grid' }, svg);
+        sv('text', { x: padL - 7, y: y(t) + 4, 'class': 'ylab', 'text-anchor': 'end' }, svg).textContent = short(t);
+      }
+      var bars = [];
+      v.forEach(function (val, i) {
+        var x = cx(i) - bw / 2, today = R.today && i === n - 1;
+        if (today && proj > val) sv('path', { d: topRounded(x, y(proj), bw, yBase - y(proj)), 'class': 'proj' }, svg);
+        var b = sv('path', { d: topRounded(x, y(val), bw, yBase - y(val)), 'class': today ? 'bar today' : 'bar' }, svg);
+        if (today) b.style.fill = 'url(#tsc-hatch-' + id + ')';
+        bars.push(b);
+      });
+      if (usual !== null && usual >= 1 && li >= 1) {  // its usual week: the 7 days before the last full day
+        var a = Math.max(0, li - 7), x1 = padL + band * a + 2, x2 = padL + band * li - 2, right = x1 > W / 2;
+        sv('line', { x1: x1, x2: x2, y1: y(usual), y2: y(usual), 'class': 'usual' }, svg);
+        sv('text', { x: right ? x2 : x1 + 2, y: y(usual) - 7, 'class': 'ulab', 'text-anchor': right ? 'end' : 'start' },
+           svg).textContent = 'usual week: ' + fmt(usual) + ' a day';
+      }
+      if (usual >= 5 && li >= 0 && v[li] / usual >= 1.5) {
+        sv('text', { x: cx(li), y: y(v[li]) - 8, 'class': 'xlab2', 'text-anchor': 'middle' }, svg)
+          .textContent = '×' + times(v[li] / usual);
+      }
+      if (cv) {
+        var pts = [], hi = -1;
+        for (var i = 0; i <= li; i++) {
+          if (cv[i] === null) continue;
+          pts.push(cx(i) + ',' + y(cv[i]));
+          if (band >= 8) sv('circle', { cx: cx(i), cy: y(cv[i]), r: 4, 'class': 'cdot' }, svg);
+          if (hi < 0 || cv[i] > cv[hi]) hi = i;
+        }
+        svg.insertBefore(sv('polyline', { points: pts.join(' '), 'class': 'cline' }), svg.querySelector('.cdot'));
+        if (hi >= 0) {
+          sv('text', { x: Math.min(Math.max(cx(hi), padL + 30), W - padR - 30), y: y(cv[hi]) - 10, 'class': 'clab',
+                       'text-anchor': 'middle' }, svg).textContent = S.cmp.short;
+        }
+      }
+      sv('text', { x: padL - 7, y: laneY + 4, 'class': 'lanelab', 'text-anchor': 'end' }, svg).textContent = 'why';
+      var byDay = {}, evg = {};
+      events.forEach(function (e) { if (e.i >= s0) (byDay[e.i - s0] = byDay[e.i - s0] || []).push(e); });
+      Object.keys(byDay).forEach(function (key) {
+        var i = +key, list = byDay[key].sort(function (a, b) { return ORDER[a.k] - ORDER[b.k]; });
+        var sc = band < 24 ? Math.max(0.45, band / 23) : 1;
+        var g = sv('g', { 'class': 'ev', transform: 'translate(' + cx(i) + ',' + laneY + ') scale(' + sc + ')' }, svg);
+        glyph(g, list[0].k);
+        if (list.length > 1 && band >= 26) sv('text', { x: 9, y: -8, 'class': 'evn' }, g).textContent = '+' + (list.length - 1);
+        evg[i] = g;
+      });
+      var every = Math.max(1, Math.ceil(50 / band));  // day labels, counted back from the last day
+      days.forEach(function (d, i) {
+        var last = i === n - 1;
+        if (!last && ((n - 1 - i) % every !== 0 || (n - 1 - i < every && band < 50))) return;
+        sv('text', { x: last ? W - padR : cx(i), y: xlY, 'class': 'xlab' + (last ? ' now' : ''),
+                     'text-anchor': last ? 'end' : 'middle' }, svg).textContent = label(d);
+      });
+      sv('text', { x: padL, y: p2top - 12, 'class': 'ptitle' }, svg).textContent = 'Total stars';
+      var tmin = Math.min.apply(null, tv), tmax = Math.max.apply(null, tv);
+      function y2(val) { return p2bot - (tmax === tmin ? 0.5 : (val - tmin) / (tmax - tmin)) * H2; }
+      sv('line', { x1: padL, x2: W - padR, y1: p2bot, y2: p2bot, 'class': 'grid' }, svg);
+      sv('line', { x1: padL, x2: W - padR, y1: p2top, y2: p2top, 'class': 'grid' }, svg);
+      var tp = tv.map(function (val, i) { return cx(i) + ',' + y2(val); });
+      sv('path', { d: 'M' + tp.join(' L') + ' L' + cx(n - 1) + ',' + p2bot + ' L' + cx(0) + ',' + p2bot + ' Z',
+                   'class': 'area' }, svg);
+      sv('polyline', { points: tp.join(' '), 'class': 'tline' }, svg);
+      sv('text', { x: padL - 7, y: p2bot + 4, 'class': 'ylab', 'text-anchor': 'end' }, svg).textContent = short(tmin);
+      sv('text', { x: padL - 7, y: p2top + 4, 'class': 'ylab', 'text-anchor': 'end' }, svg).textContent = short(tmax);
+      var xh = sv('line', { y1: top - 12, y2: p2bot, 'class': 'xhair', visibility: 'hidden' }, svg);
+      var td = sv('circle', { r: 4.5, 'class': 'tdot', visibility: 'hidden' }, svg);
+      var hit = sv('rect', { x: padL, y: 0, width: W - padL - padR, height: Ht, 'class': 'hit' }, svg);
+      S.g = { n: n, s0: s0, cx: cx, band: band, padL: padL, W: W, v: v, tv: tv, days: days, cv: cv, byDay: byDay,
+              bars: bars, evg: evg, xh: xh, td: td, y2: y2 };
+      if (S.sel !== null && S.sel >= n) { S.sel = null; S.pinned = false; }
+      select(S.sel);
+      hit.addEventListener('pointermove', function (ev) { if (!S.pinned) select(dayAt(ev)); });
+      hit.addEventListener('pointerleave', function () { if (!S.pinned) select(null); });
+      hit.addEventListener('click', function (ev) {
+        var i = dayAt(ev);
+        if (S.pinned && S.sel === i) { S.pinned = false; select(null); } else { S.pinned = true; select(i); }
+      });
+    }
+    function dayAt(ev) {
+      var g = S.g, b = svg.getBoundingClientRect(), x = (ev.clientX - b.left) * (g.W / b.width);
+      return Math.min(g.n - 1, Math.max(0, Math.floor((x - g.padL) / g.band)));
+    }
+    function select(i) {
+      var g = S.g;
+      S.sel = i;
+      g.bars.forEach(function (b, j) { b.classList.toggle('on', j === i); });
+      Object.keys(g.evg).forEach(function (j) { g.evg[j].classList.toggle('on', +j === i); });
+      svg.classList.toggle('picked', i !== null);
+      if (i === null) {
+        g.xh.setAttribute('visibility', 'hidden');
+        g.td.setAttribute('visibility', 'hidden');
+        tip.hidden = true;
+        return;
+      }
+      var x = g.cx(i), today = R.today && i === g.n - 1, rank = R.ranks && R.ranks[g.s0 + i];
+      g.xh.setAttribute('x1', x); g.xh.setAttribute('x2', x); g.xh.setAttribute('visibility', 'visible');
+      g.td.setAttribute('cx', x); g.td.setAttribute('cy', g.y2(g.tv[i])); g.td.setAttribute('visibility', 'visible');
+      tip.textContent = '';
+      tip.appendChild(el('h4', null, weekday(g.days[i]) + ', ' + label(g.days[i]) + (today ? ' · so far' : '')));
+      function row(sw, name, val, muted) {
+        var d = el('div', 'tsc-row' + (muted ? ' m' : ''));
+        if (sw !== null) d.appendChild(el('i', 'sw ' + sw));
+        d.appendChild(el('span', null, name));
+        if (val !== null) d.appendChild(el('b', null, val));
+        tip.appendChild(d);
+      }
+      row('', R.short, fmt(g.v[i]) + (today ? ' so far' : ''));
+      if (today && proj) row(null, 'On pace for ' + fmt(proj) + ' by midnight', null, true);
+      if (g.cv && g.cv[i] !== null) row('line', S.cmp.short, fmt(g.cv[i]) + (today ? ' so far' : ''));
+      row(null, today ? 'Total now' : 'Total at day end', fmt(g.tv[i]), true);
+      if (rank) row(null, 'On the TrueStars ranking', '#' + rank, true);
+      var list = g.byDay[i] || [];
+      if (list.length) {
+        var evs = el('div', 'tsc-evs');
+        list.forEach(function (e) {
+          var d = el('div');
+          d.appendChild(badge(e.k));
+          d.appendChild(el('span', null, e.t + (e.x ? ' · ' + e.x : '')));
+          evs.appendChild(d);
+        });
+        tip.appendChild(evs);
+      }
+      tip.hidden = false;
+      var ww = wrap.clientWidth, scale = ww / g.W, w = tip.offsetWidth, left = x * scale + 14;
+      if (left + w > ww) left = x * scale - 14 - w;
+      tip.style.left = Math.max(0, left) + 'px';
+    }
+    function whyList(s0) {
+      why.textContent = '';
+      var evs = events.filter(function (e) { return e.i >= s0; });
+      var main = evs.filter(function (e) { return e.k !== 'bsky'; }), bs = evs.filter(function (e) { return e.k === 'bsky'; });
+      function item(k, d, text, url) {
+        var li = el('li'), span = el('span');
+        li.appendChild(badge(k));
+        li.appendChild(el('span', 'd', d));
+        span.appendChild(link(text, url));
+        li.appendChild(span);
+        why.appendChild(li);
+      }
+      if (main.length > 10) why.appendChild(el('li', 'more', (main.length - 10) + ' earlier ones are in the table below.'));
+      main.slice(-10).forEach(function (e) { item(e.k, label(R.days[e.i]), e.t + (e.x ? ' · ' + e.x : ''), e.u); });
+      if (bs.length) {
+        var posts = bs.reduce(function (a, e) { return a + e.n; }, 0);
+        var busy = bs.slice().sort(function (a, b) { return b.n - a.n; })[0];
+        item('bsky', bs.length + (bs.length === 1 ? ' day' : ' days'), posts + ' Bluesky post' + (posts === 1 ? '' : 's') +
+             ' linked it; the busiest day was ' + label(R.days[busy.i]), busy.u);
+      }
+      if (!evs.length) why.appendChild(el('li', 'more', 'No Hacker News posts, videos, releases or Bluesky posts found for these days.'));
+    }
+    function tableDraw(s0) {
+      table.textContent = '';
+      var head = el('thead'), hr = el('tr'), body = el('tbody');
+      ['Day', 'Stars', 'Total', 'Rank', 'What happened'].forEach(function (h, j) {
+        var c = el('th', j && j < 4 ? 'n' : null, h);
+        c.scope = 'col';
+        hr.appendChild(c);
+      });
+      head.appendChild(hr);
+      table.appendChild(head);
+      for (var i = ALL - 1; i >= s0; i--) {
+        var tr = el('tr'), today = R.today && i === ALL - 1;
+        var d = el('th', null, weekday(R.days[i]) + ', ' + label(R.days[i]) + (today ? ' (so far)' : ''));
+        d.scope = 'row';
+        tr.appendChild(d);
+        tr.appendChild(el('td', 'n', fmt(R.values[i])));
+        tr.appendChild(el('td', 'n', fmt(tot[i])));
+        tr.appendChild(el('td', 'n', R.ranks && R.ranks[i] ? '#' + R.ranks[i] : '—'));
+        tr.appendChild(el('td', null, events.filter(function (e) { return e.i === i; })
+          .map(function (e) { return e.t + (e.x ? ' · ' + e.x : ''); }).join('; ') || '—'));
+        body.appendChild(tr);
+      }
+      table.appendChild(body);
+    }
+    function render() {
+      var s0 = ALL - Math.min(ALL, S.range + 1);
+      sum.textContent = summary(s0);
+      legendDraw();
+      draw();
+      whyList(s0);
+      tableDraw(s0);
+    }
+    wrap.addEventListener('keydown', function (e) {
+      var n = S.g.n, i = S.sel;
+      if (e.key === 'ArrowRight') i = i === null ? 0 : Math.min(n - 1, i + 1);
+      else if (e.key === 'ArrowLeft') i = i === null ? n - 1 : Math.max(0, i - 1);
+      else if (e.key === 'Home') i = 0;
+      else if (e.key === 'End') i = n - 1;
+      else if (e.key === 'Escape' && S.sel !== null) { e.preventDefault(); S.pinned = false; select(null); return; }
+      else return;
+      e.preventDefault();
+      S.pinned = true;
+      select(i);
+    });
+    render();
+    if (window.ResizeObserver) {
+      var seen = 0;
+      new ResizeObserver(function (en) {
+        var w = Math.round(en[0].contentRect.width);
+        if (w && w !== seen) { seen = w; draw(); }
+      }).observe(wrap);
+    }
+  };
+})();
+"""
+
+
+MOVED = Template("""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TrueStars</title>
+<meta name="robots" content="noindex">
+<meta http-equiv="refresh" content="0; url=$to">
+<script>location.replace('$to' + location.hash);</script>
+</head>
+<body><p>$what: <a href="$to">open it</a>.</p></body>
+</html>
+""")
 
 
 def write(path, text):
@@ -2169,7 +2729,7 @@ def load_social():
 
 
 def social():
-    """YouTube videos and posts on X that link the top repos, looked up once a day per repo. Any refusal
+    """YouTube videos and posts on X and Bluesky that link the top repos, looked up once a day per repo. Any refusal
     (a wrong key, no credit left, a used-up quota) only stops that source for this run."""
     with open(LATEST) as fh:
         data = json.load(fh)
@@ -2187,14 +2747,16 @@ def social():
         return max(latest - dt.timedelta(days=r["age"] + 1), latest - dt.timedelta(days=YT_SEARCH_DAYS))
 
     key, token = os.environ.get("GOOGLE_API_KEY", ""), os.environ.get("X_BEARER_TOKEN", "")
-    print("     YouTube and X for the top repos ...", flush=True)
-    for source, label, secret, limit, look in (
-            ("youtube", "YouTube", key, YT_TOP, lambda r: youtube(r["name"], since(r), key)),
-            ("x", "X", token, X_TOP, lambda r: x_posts(r["name"], token))):
+    clean = [r for r in rows if not r["flags"]]  # Bluesky: the repos Explore can show
+    print("     YouTube, X and Bluesky for the top repos ...", flush=True)
+    for source, label, secret, pick, look in (
+            ("youtube", "YouTube", key, top[:YT_TOP], lambda r: youtube(r["name"], since(r), key)),
+            ("x", "X", token, top[:X_TOP], lambda r: x_posts(r["name"], token)),
+            ("bsky", "Bluesky", "no key needed", clean[:BSKY_TOP], lambda r: bluesky(r["name"]))):
         if not secret:
             print(f"     {label}: no key, skipped")
             continue
-        todo = [r for r in top[:limit] if stale(r["slug"], source)]
+        todo = [r for r in pick if stale(r["slug"], source)]
         done = found = 0
         for r in todo:
             status, result = look(r)
@@ -2206,7 +2768,7 @@ def social():
             done += 1
             found += bool(result if source == "youtube" else result["week"])
         print(f"     {label}: {done} looked up, {found} with videos or posts that link the repo, "
-              f"{len(top[:limit]) - len(todo)} still fresh")
+              f"{len(pick) - len(todo)} still fresh")
     if key and REDDIT_APP:  # the Reddit test: the log shows whether Google's site search finds threads
         for r in top[:5]:
             status, result = reddit_threads(r["name"], key)
@@ -2223,13 +2785,13 @@ def social():
         if entry:
             kept[slug] = entry
     write(SOCIAL, json.dumps({"generated_at": stamp, "about": (
-        f"YouTube and X data shown on TrueStars, looked up daily for the top repos and deleted after "
+        f"YouTube, X and Bluesky data shown on TrueStars, looked up daily for the top repos and deleted after "
         f"{SOCIAL_KEEP_DAYS} days. YouTube data comes from the YouTube API Services."), "repos": kept},
         separators=(",", ":")))
 
 
 def social_chips(row, repo, latest):
-    """Reasons from YouTube and X, for the repos looked up in social()."""
+    """Reasons from YouTube, X and Bluesky, for the repos looked up in social()."""
     chips, found = [], row["social"]
     videos = [v for v in (found.get("youtube") or {}).get("videos") or []
               if v["views"] >= YT_MIN_VIEWS and days_between(v["published"], latest) <= YT_DAYS]
@@ -2247,11 +2809,53 @@ def social_chips(row, repo, latest):
     posts = (found.get("x") or {}).get("week") or 0
     if posts >= X_MIN_POSTS:
         chips.append({"kind": "x", "url": x_search(row["name"]), "text": f"X · {posts:,} posts in 7 days"})
+    posts = (found.get("bsky") or {}).get("week") or 0
+    if posts >= BSKY_MIN_POSTS:
+        chips.append({"kind": "bsky", "url": bsky_search(row["name"]), "text": f"Bluesky · {posts:,} posts in 7 days"})
     return chips
+
+
+def social_events(row):
+    """YouTube videos and the days with Bluesky posts, for the star charts."""
+    found, events = row["social"], []
+    for v in (found.get("youtube") or {}).get("videos") or []:
+        if v["views"] >= YT_MIN_VIEWS:
+            events.append({"day": pacific_day(v["published"]).isoformat(), "kind": "yt", "text": f"YouTube: {v['title']}",
+                           "extra": f"{fmt_count(v['views'])} views · {v['channel']}",
+                           "url": f"https://www.youtube.com/watch?v={v['id']}"})
+    for day, n, url in (found.get("bsky") or {}).get("days") or []:
+        events.append({"day": day, "kind": "bsky", "text": f"{n:,} Bluesky post{'s' if n != 1 else ''} linked it",
+                       "extra": "", "url": url, "n": n})
+    return [e for e in events if e["day"] >= row["chart_start"]]
+
+
+def talk_of(row):
+    """Where people talk about a repo: [kind, text, url] for Hacker News (the last TALK_DAYS days),
+    Bluesky and X (the last 7 days) and YouTube."""
+    found, talk = row.get("social") or {}, []
+    posts = row.get("hn_recent") or []
+    if posts:
+        top = max(posts, key=lambda s: s["points"])
+        talk.append(["hn", f"Hacker News · {len(posts)} post{'s' if len(posts) != 1 else ''} · top "
+                           f"{top['points']:,} point{'s' if top['points'] != 1 else ''}",
+                     f"https://news.ycombinator.com/item?id={top['id']}"])
+    for kind, label, link in (("bsky", "Bluesky", bsky_search), ("x", "X", x_search)):
+        n = (found.get(kind) or {}).get("week") or 0
+        if n:
+            talk.append([kind, f"{label} · {n:,} post{'s' if n != 1 else ''} in 7 days", link(row["name"])])
+    videos = (found.get("youtube") or {}).get("videos") or []
+    if videos:
+        talk.append(["yt", f"YouTube · {len(videos)} video{'s' if len(videos) != 1 else ''} · top "
+                           f"{fmt_count(videos[0]['views'])} views", f"https://www.youtube.com/watch?v={videos[0]['id']}"])
+    return talk
 
 
 def x_search(full_name):
     return "https://x.com/search?" + urllib.parse.urlencode({"q": f'url:"github.com/{full_name}"', "f": "live"})
+
+
+def bsky_search(full_name):
+    return "https://bsky.app/search?" + urllib.parse.urlencode({"q": f"github.com/{full_name}"})
 
 
 def build():
@@ -2275,6 +2879,7 @@ def build():
         r["social"] = found.get(r["slug"]) or {}
         r["why"] += social_chips(r, by_name.get(r["name"]), latest)
         r["why"].sort(key=lambda w: WHY_ORDER.index(w["kind"]))
+        r["events"] += social_events(r)
         r["heat"], r["heat_parts"], r["pace"], r["speedup"] = heat(r, frac)
     rising = sorted((r for r in rows if not r["flags"] and r["rising"]),  # no red flags; biggest gain first
                     key=lambda r: (r["rising"]["base"] - r["rising"]["rate"], r["name"].lower()))[:RISE_LIST]
@@ -2285,9 +2890,8 @@ def build():
         shutil.rmtree(SITE)  # rebuilt from scratch every run
     updated = f"{generated:%b} {generated.day}, {generated:%-I:%M %p} Pacific"
     write(os.path.join(SITE, "style.css"), STYLE)
-    write(os.path.join(SITE, "favicon.svg"),
-          f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><polygon fill="#2c55c9" '
-          f'points="{star_points(10, 10.6, 9.5, 4)}"/></svg>')
+    write(os.path.join(SITE, "chart.js"), CHART_JS)
+    write(os.path.join(SITE, "favicon.svg"), FAVICON)
     render_index(rows, rising, day, latest, data, updated)
     render_how(updated)
     render_privacy(updated)
@@ -2295,19 +2899,24 @@ def build():
         shutil.copyfile(SOCIAL, os.path.join(SITE, "social.json"))
     fresh = {r["slug"]: r for r in rows}
     for slug, entry in history.items():
-        render_repo(slug, entry, fresh.get(slug), latest, updated)
+        render_repo(slug, entry, fresh.get(slug), latest, frac, updated)
         render_badge(slug, best_rank(entry["ranks"])[0])
     try:
-        render_explore(rows, day, latest, generated, updated)
-    except Exception:  # a preview page must never keep the ranking from publishing
-        print("Explore page failed; the rest of the site is built:", file=sys.stderr)
+        render_explore(rows, day, latest, generated, frac, history, updated)
+    except Exception:  # Explore must never keep the ranking from publishing
+        print("Explore (the home page) failed; the rest of the site is built:", file=sys.stderr)
         traceback.print_exc()
+    if not os.path.exists(os.path.join(SITE, "index.html")):  # no Explore today: the home page opens the ranking
+        write(os.path.join(SITE, "index.html"), MOVED.substitute(to="ranking/", what="The ranking"))
+    # Explore was at /explore/ until it became the home page; old links, quick looks (#owner/repo) included
+    write(os.path.join(SITE, "explore", "index.html"), MOVED.substitute(to="../", what="Explore is now the home page"))
     write(os.path.join(SITE, "404.html"), shell(
         "Not found · TrueStars", '<h1>Page not found</h1><p>This repo has not been in the ranking yet. '
-        '<a href="/index.html">See today\'s ranking</a>.</p>', "/", "Page not found.", updated))
-    # Search engines: every page that rendered above, home and How first
-    pages = ["", "how/", "privacy/"] + [f"r/{slug}/" for slug in sorted(history)
-                            if os.path.exists(os.path.join(SITE, "r", slug, "index.html"))]
+        '<a href="/index.html">Explore today\'s repos</a> or <a href="/ranking/index.html">see the ranking</a>.</p>',
+        "/", "Page not found.", updated))
+    # Search engines: every page that rendered above, home and the ranking first
+    pages = ["", "ranking/", "how/", "privacy/"] + [f"r/{slug}/" for slug in sorted(history)
+                                                    if os.path.exists(os.path.join(SITE, "r", slug, "index.html"))]
     write(os.path.join(SITE, "sitemap.xml"),
           '<?xml version="1.0" encoding="UTF-8"?>\n'
           '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
@@ -2325,6 +2934,8 @@ STYLE = """
   --good: #1d6b44; --good-bg: #e3f2e9; --warn: #8a5800; --warn-bg: #fbefd5;
   --bad: #a3261b; --bad-bg: #fbe4e1; --bar: #2c55c9; --bar-today: #a8b9ea; --bar-zero: #dcd8cf;
   --accent-bg: #e6ecfa; --cool: #4f5f7a; --cool-bg: #e8ecf2;
+  --c2: #e8590c; --grid: #ebe8e1; --area: rgba(44, 85, 201, 0.10); --tip: #ffffff;
+  --shadow: 0 10px 30px rgba(29, 30, 32, 0.16); --top-bg: rgba(255, 255, 255, 0.86);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -2333,6 +2944,8 @@ STYLE = """
     --good: #79d3a0; --good-bg: #15301f; --warn: #f0c46c; --warn-bg: #33270e;
     --bad: #ff9187; --bad-bg: #3b1714; --bar: #87a6ff; --bar-today: #3d4c78; --bar-zero: #303236;
     --accent-bg: #1f2945; --cool: #a9b7d0; --cool-bg: #242a35;
+    --c2: #e9682a; --grid: #26282c; --area: rgba(135, 166, 255, 0.14); --tip: #25272b;
+    --shadow: 0 10px 30px rgba(0, 0, 0, 0.55); --top-bg: rgba(27, 28, 31, 0.86);
   }
 }
 * { box-sizing: border-box; }
@@ -2340,13 +2953,24 @@ body { margin: 0; background: var(--bg); color: var(--ink);
   font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
 a { color: var(--accent); }
 .wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
-.top { border-bottom: 1px solid var(--line); background: var(--panel); }
-.top .wrap { display: flex; align-items: center; justify-content: space-between; height: 56px; }
-.logo { display: inline-flex; align-items: center; gap: 8px; font-weight: 750; font-size: 18px;
-  color: var(--ink); text-decoration: none; letter-spacing: -0.01em; }
-.star { width: 20px; height: 20px; fill: var(--gold); }
-.top nav a { margin-left: 18px; color: var(--muted); text-decoration: none; font-size: 14px; }
-.top nav a:hover { color: var(--ink); }
+.top { position: sticky; top: 0; z-index: 20; border-bottom: 1px solid var(--line); background: var(--top-bg);
+  -webkit-backdrop-filter: saturate(1.4) blur(12px); backdrop-filter: saturate(1.4) blur(12px); }
+.top .wrap { display: flex; align-items: center; gap: 16px; height: 56px; }
+.logo { display: inline-flex; align-items: center; gap: 9px; font-weight: 760; font-size: 18px;
+  color: var(--ink); text-decoration: none; letter-spacing: -0.02em; }
+.mark { width: 28px; height: 28px; flex: none; }
+.menu { display: flex; gap: 2px; margin: 0 auto; padding: 3px; border-radius: 999px; background: var(--chip); }
+.menu a { padding: 6px 14px; border-radius: 999px; color: var(--muted); font-size: 14px; font-weight: 600;
+  text-decoration: none; white-space: nowrap; }
+.menu a .ico { display: none; }
+.menu a:hover { color: var(--ink); }
+.menu a[aria-current="page"] { background: var(--panel); color: var(--ink); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
+.search-btn { display: grid; place-items: center; width: 36px; height: 36px; flex: none; border-radius: 50%;
+  background: var(--chip); color: var(--ink); }
+.search-btn:hover { color: var(--accent); }
+.ico { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round;
+  stroke-linejoin: round; }
+.tabs { display: none; }
 main.wrap { padding-top: 28px; padding-bottom: 48px; }
 h1 { font-size: 26px; margin: 0 0 14px; letter-spacing: -0.02em; line-height: 1.25; }
 h2 { font-size: 16px; margin: 0 0 10px; }
@@ -2439,7 +3063,95 @@ pre { background: var(--chip); border-radius: 8px; padding: 10px 12px; font-size
 .prose li { margin-bottom: 4px; }
 .foot { color: var(--muted); font-size: 12px; padding-bottom: 32px; }
 .foot a { color: inherit; }
+/* The star chart (chart.js) */
+.tsc-top { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: flex-start; justify-content: space-between; }
+.tsc-titles { min-width: 0; flex: 1 1 260px; }
+.tsc-titles h3 { margin: 0; font-size: 14px; }
+.tsc-sum { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+.tsc-ctrl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tsc-seg { display: inline-flex; gap: 3px; padding: 3px; border-radius: 10px; background: var(--chip); }
+.tsc-seg button { min-height: 30px; padding: 5px 10px; border: 0; border-radius: 8px; background: transparent;
+  color: var(--muted); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.tsc-seg button[aria-pressed="true"] { background: var(--panel); color: var(--ink); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
+.tsc-cmp { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); }
+.tsc-cmp select { max-width: 11rem; min-height: 32px; padding: 5px 6px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); color: var(--ink); font: inherit; font-size: 13px; }
+.tsc-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 10px 0 2px; font-size: 12px; color: var(--muted); }
+.tsc-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { display: inline-block; flex: none; width: 12px; height: 12px; border-radius: 3px; background: var(--bar); }
+.sw.hatch { background: repeating-linear-gradient(45deg, var(--bar) 0 2px, transparent 2px 5px);
+  box-shadow: inset 0 0 0 1px var(--bar); }
+.sw.dash { width: 16px; height: 0; border-radius: 0; background: none; border-top: 2px dashed var(--muted); }
+.sw.line { width: 16px; height: 3px; border-radius: 2px; background: var(--c2); }
+.tsc-wrap { position: relative; border-radius: 10px; touch-action: pan-y; }
+.tsc-wrap:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tsc-plot { display: block; width: 100%; height: auto; overflow: visible; }
+.tsc-plot .grid { stroke: var(--grid); stroke-width: 1; }
+.tsc-plot .base { stroke: var(--line); stroke-width: 1.5; }
+.tsc-plot .ylab, .tsc-plot .xlab { fill: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.tsc-plot .xlab.now { fill: var(--ink); font-weight: 650; }
+.tsc-plot .ptitle { fill: var(--ink); font-size: 12.5px; font-weight: 650; }
+.tsc-plot .lanelab { fill: var(--muted); font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.tsc-plot .bar { fill: var(--bar); transition: opacity 0.12s; }
+.tsc-plot .bar.today { stroke: var(--bar); stroke-width: 1.2; }
+.tsc-plot .hatch { fill: var(--bar); }
+.tsc-plot .proj { fill: none; stroke: var(--bar); stroke-width: 1.5; stroke-dasharray: 3 3; }
+.tsc-plot.picked .bar:not(.on) { opacity: 0.38; }
+.tsc-plot .usual { stroke: var(--muted); stroke-width: 1.6; stroke-dasharray: 5 4; }
+.tsc-plot .ulab, .tsc-plot .xlab2, .tsc-plot .clab, .tsc-plot .evn { font-size: 11.5px; font-weight: 600; paint-order: stroke;
+  stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+.tsc-plot .ulab { fill: var(--muted); }
+.tsc-plot .xlab2, .tsc-plot .clab, .tsc-plot .evn { fill: var(--ink); }
+.tsc-plot .cline { fill: none; stroke: var(--c2); stroke-width: 2; stroke-linejoin: round; }
+.tsc-plot .cdot { fill: var(--c2); stroke: var(--panel); stroke-width: 2; }
+.tsc-plot .area { fill: var(--area); }
+.tsc-plot .tline { fill: none; stroke: var(--bar); stroke-width: 2; stroke-linejoin: round; }
+.tsc-plot .tdot { fill: var(--bar); stroke: var(--panel); stroke-width: 2; }
+.tsc-plot .xhair { stroke: var(--ink); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.55; pointer-events: none; }
+.tsc-plot .ev circle { fill: var(--chip); stroke: var(--line); stroke-width: 1; }
+.tsc-plot .ev.on circle { fill: var(--panel); stroke: var(--ink); stroke-width: 1.5; }
+.tsc-plot .ev .g { fill: var(--ink); }
+.tsc-plot .ev .gt { fill: var(--ink); font-size: 11px; font-weight: 750; }
+.tsc-plot .hit { fill: transparent; cursor: crosshair; }
+.tsc-tip { position: absolute; top: 6px; z-index: 2; min-width: 190px; max-width: 260px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--tip); box-shadow: var(--shadow); font-size: 13px;
+  pointer-events: none; }
+.tsc-tip[hidden] { display: none; }
+.tsc-tip h4 { margin: 0 0 6px; font-size: 13px; }
+.tsc-row { display: flex; align-items: center; gap: 7px; margin: 2px 0; }
+.tsc-row b { margin-left: auto; font-variant-numeric: tabular-nums; }
+.tsc-row.m { color: var(--muted); }
+.tsc-evs { display: grid; gap: 5px; margin: 7px 0 0; padding: 7px 0 0; border-top: 1px solid var(--line); }
+.tsc-evs div { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 6px; line-height: 1.35; }
+.tsc-kind { display: inline-grid; place-items: center; width: 18px; height: 18px; border: 1px solid var(--line);
+  border-radius: 50%; background: var(--chip); color: var(--ink); font-size: 10px; font-weight: 750; }
+.tsc-kind svg { width: 11px; height: 11px; fill: var(--ink); }
+.tsc-hint { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+.tsc-why { display: grid; gap: 6px; margin: 10px 0 0; padding: 0; list-style: none; font-size: 13.5px; }
+.tsc-why li { display: grid; grid-template-columns: 18px 3.6rem minmax(0, 1fr); gap: 8px; align-items: start; }
+.tsc-why li.more { display: block; color: var(--muted); }
+.tsc-why .d { color: var(--muted); font-variant-numeric: tabular-nums; }
+.tsc-why a { overflow-wrap: anywhere; }
+.tsc-days { margin-top: 10px; font-size: 13px; }
+.tsc-days summary { cursor: pointer; color: var(--accent); }
+.tsc-table { overflow-x: auto; margin-top: 6px; border: 1px solid var(--line); border-radius: 10px; }
+.tsc-table table { width: 100%; min-width: 480px; border-collapse: collapse; font-size: 13px; }
+.tsc-table th, .tsc-table td { padding: 6px 10px; border-top: 1px solid var(--line); text-align: left; vertical-align: top; }
+.tsc-table thead th { border-top: 0; color: var(--muted); font-size: 11px; font-weight: 650; letter-spacing: 0.04em;
+  text-transform: uppercase; }
+.tsc-table .n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 @media (max-width: 760px) {
+  .top { position: static; }
+  .menu { display: none; }
+  .search-btn { margin-left: auto; }
+  .tabs { position: fixed; z-index: 20; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: repeat(3, 1fr);
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--line);
+    background: var(--top-bg); -webkit-backdrop-filter: saturate(1.4) blur(12px); backdrop-filter: saturate(1.4) blur(12px); }
+  .tabs a { display: grid; justify-items: center; gap: 2px; padding: 4px 0; color: var(--muted); font-size: 11px;
+    font-weight: 600; text-decoration: none; }
+  .tabs .ico { width: 22px; height: 22px; }
+  .tabs a[aria-current="page"] { color: var(--accent); }
+  body { padding-bottom: calc(62px + env(safe-area-inset-bottom, 0px)); }
   .row { grid-template-columns: 28px 1fr; }
   .nums, .spark { grid-column: 2; }
   .chip, .dir { white-space: normal; }
@@ -2463,6 +3175,7 @@ if __name__ == "__main__":
             for secret in (os.environ.get("GOOGLE_API_KEY"), os.environ.get("X_BEARER_TOKEN")):
                 if secret:
                     report = report.replace(secret, "***")
-            print("YouTube and X lookups failed; the site is built without new ones:\n" + report, file=sys.stderr)
+            print("YouTube, X and Bluesky lookups failed; the site is built without new ones:\n" + report,
+                  file=sys.stderr)
     if step in ("all", "build"):
         build()
