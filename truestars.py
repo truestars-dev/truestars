@@ -118,10 +118,10 @@ CHART_HN_MIN = 5           # Hacker News posts with this many points are marked 
 TALK_DAYS = 30             # "Where people talk": Hacker News posts from this many days
 # The AI step (OpenAI): use cases and "What's the hype about" for Explore's hottest repos, and pictures for
 # the big cards. The owner picked GPT Image 2.6 for the pictures (2026-11-05); private samples compare its
-# Flare and Sunburst versions before anything goes on the site. "samples" writes them for the top
-# AI_SAMPLE_REPOS to ai-samples/ (a workflow artifact, never the site), on a code push or a manual run only;
-# "on" puts the notes and pictures on the site.
-AI_MODE = "samples"        # off | samples | on
+# Flare and Sunburst versions before anything goes on the site (made 2026-11-05, run 41985303305; off again
+# until the owner picks one). "samples" writes them for the top AI_SAMPLE_REPOS to ai-samples/ (a workflow
+# artifact, never the site), on a code push or a manual run only; "on" puts the notes and pictures on the site.
+AI_MODE = "off"            # off | samples | on
 AI_TEXT_MODEL = "gpt-6-luna"           # OpenAI's model "for focused, high-volume tasks"
 AI_IMAGE_MODEL = "gpt-image-2.6-flare"
 AI_SAMPLE_TEXT_MODELS = ("gpt-6-luna", "gpt-6.1-terra")
@@ -976,14 +976,18 @@ def icon_svg(paths):
     return f'<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">{paths}</svg>'
 
 
-# The logo (picked 2026-11-05 from the three in the Explore v2 proposal): a white star on a blue tile, like an
-# app icon. The README badge keeps its own gold star.
-LOGO_STAR = ("12.00,5.30 14.00,9.95 19.04,10.41 15.23,13.75 16.35,18.69 12.00,16.10 7.65,18.69 8.77,13.75 "
-             "4.96,10.41 10.00,9.95")
-LOGO_INNER = ('<defs><linearGradient id="ts-tile" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3c64e6"/>'
-              '<stop offset="1" stop-color="#7b4fe0"/></linearGradient></defs>'
-              '<rect x="1" y="1" width="22" height="22" rx="6.4" fill="url(#ts-tile)"/>'
-              f'<polygon points="{LOGO_STAR}" fill="#fff" stroke="#fff" stroke-width="1.4" stroke-linejoin="round"/>')
+# The logo (the owner's pick on 2026-11-05, "logo b", from the three in the Explore v2 proposal): a gold star
+# rising with a trail behind it, for what is rising fastest. The README badge keeps its own gold star.
+LOGO_INNER = ('<defs><linearGradient id="ts-trail" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#f08a24" '
+              'stop-opacity="0.35"/><stop offset="1" stop-color="#f08a24"/></linearGradient>'
+              '<linearGradient id="ts-gold" x1="0" y1="0" x2="0.4" y2="1"><stop offset="0" stop-color="#ffd45c"/>'
+              '<stop offset="1" stop-color="#f08a24"/></linearGradient></defs>'
+              '<g stroke="url(#ts-trail)" stroke-linecap="round"><line x1="2.6" y1="21.4" x2="8.8" y2="15.2" '
+              'stroke-width="2.4"/><line x1="2.3" y1="15.4" x2="5.6" y2="12.1" stroke-width="2"/>'
+              '<line x1="8.6" y1="21.7" x2="11.9" y2="18.4" stroke-width="2"/></g>'
+              '<polygon points="16.58,1.44 17.51,6.96 22.78,8.83 17.82,11.41 17.67,17.00 13.68,13.09 8.32,14.67 '
+              '10.81,9.67 7.65,5.05 13.18,5.88" fill="url(#ts-gold)" stroke="url(#ts-gold)" stroke-width="1.8" '
+              'stroke-linejoin="round"/>')
 LOGO = f'<svg class="mark" viewBox="0 0 24 24" aria-hidden="true">{LOGO_INNER}</svg>'
 FAVICON = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">{LOGO_INNER}</svg>\n'
 SEARCH_ICON = icon_svg('<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>')
