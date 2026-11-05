@@ -8,15 +8,16 @@ The GitHub repos gaining stars fastest, and why. Live at https://truestars.dev
   A flag is a reason to look closer, not proof.
 - **Where each repo stands:** rising, at its peak, steady or cooling against its own best day, and a
   "Rising now" list of repos getting at least 3 times their usual daily stars.
-- **Why it may be trending:** Hacker News posts and releases that moved the stars, waves of repos that
-  share a GitHub topic, brand-new and recent launches, well-known owners.
+- **Why it may be trending:** Hacker News posts, YouTube videos and releases that moved the stars, posts on X
+  that link the repo, waves of repos that share a GitHub topic, brand-new and recent launches, well-known owners.
 - **A badge** for every repo that makes the ranking, showing its best daily rank.
 
 How the ranking and the check work: https://truestars.dev/how/
 
 ## Run it yourself
 
-Python 3.12 and a GitHub token (`GITHUB_TOKEN`, or a logged-in `gh`). No other installs.
+Python 3.12 and a GitHub token (`GITHUB_TOKEN`, or a logged-in `gh`). No other installs. YouTube needs
+`GOOGLE_API_KEY` and X needs `X_BEARER_TOKEN`; without them those lookups are skipped.
 
     python3 -I truestars.py           # collect today's data, then build the site into site/
     python3 -I truestars.py build     # rebuild the site from the saved data

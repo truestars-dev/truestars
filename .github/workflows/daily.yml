@@ -25,6 +25,8 @@ jobs:
         run: python3 -I truestars.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}   # YouTube (and the Reddit test); optional
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}   # X post counts, prepaid; optional
       - name: Save the day's history
         run: |
           git config user.name "github-actions[bot]"

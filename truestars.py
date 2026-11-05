@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """TrueStars: the GitHub repos gaining stars fastest, where each one stands, why, and a fake-star check.
 
-  python3 -I truestars.py           collect today's data, then build the site
+  python3 -I truestars.py           collect today's data, look up YouTube and X, then build the site
   python3 -I truestars.py collect   only collect                  -> data/latest.json
+  python3 -I truestars.py social    only YouTube and X, for the top repos -> data/social.json
   python3 -I truestars.py build     only build from the saved data -> data/days/<day>.json, site/
 
 Needs GITHUB_TOKEN in the environment or a logged-in GitHub CLI (`gh`). Standard library only.
+GOOGLE_API_KEY (YouTube) and X_BEARER_TOKEN (X) are optional: without them that source is skipped.
 """
 import collections
 import colorsys
@@ -88,7 +90,22 @@ BIG_ORGS = {               # well-known companies and AI labs (GitHub logins, lo
     "huggingface", "cloudflare", "vercel", "vercel-labs", "stripe", "spotify", "netflix", "shopify", "ibm",
     "intel",
 }
-WHY_ORDER = ["hn", "release", "wave", "new", "org", "reach"]
+WHY_ORDER = ["hn", "youtube", "x", "release", "wave", "new", "org", "reach"]
+# YouTube and X: looked up once a day for the top repos (social()). The data lives only in the published
+# site/social.json, which the next run reads back: never in data/days, because YouTube's rules let us keep
+# its data for 30 days at most (we keep it SOCIAL_KEEP_DAYS) and git keeps history forever.
+SOCIAL = os.path.join(DATA, "social.json")
+SOCIAL_URL = "https://truestars.dev/social.json"
+SOCIAL_KINDS = ("youtube", "x")  # reason chips left out of data/days
+SOCIAL_FRESH_HOURS = 20    # data younger than this is reused, so each repo is looked up once a day
+SOCIAL_KEEP_DAYS = 3       # data older than this is deleted
+YT_TOP = 60                # YouTube: the top repos searched each day (YouTube allows 100 searches a day)
+YT_SEARCH_DAYS = 90        # videos posted in this many days whose description links the repo
+YT_DAYS = 30               # a YouTube reason: a linking video posted in the last this many days ...
+YT_MIN_VIEWS = 1000        # ... with this many views
+X_TOP = 50                 # X: the top repos counted each day (one prepaid count each, $0.005)
+X_MIN_POSTS = 20           # an X reason: this many posts linked the repo in the last 7 days (reposts not counted)
+REDDIT_APP = ""            # the Reddit test: "<Google Cloud project id>/<site search app id>", once the owner makes it
 # The Explore page (a preview: not linked from the other pages, hidden from search engines) orders
 # repos by TrueStars Heat, see heat()
 HEAT_FULL = 3000           # stars a day that earn all 60 "stars now" points
@@ -295,6 +312,104 @@ def hacker_news(full_name):
             stories.append({"title": hit.get("title") or "", "points": hit.get("points") or 0,
                             "date": (hit.get("created_at") or "")[:10], "id": hit.get("objectID")})
     return sorted(stories, key=lambda s: s["date"], reverse=True)
+
+
+def links_repo(text, full_name):
+    """True when the text links github.com/<full_name> itself, not a repo with a longer name."""
+    for owner, name in re.findall(r"github\.com/([\w.-]+)/([\w.-]+)", text or "", re.I):
+        name = name.rstrip(".")  # a sentence's full stop
+        if name.lower().endswith(".git"):
+            name = name[:-4]
+        if f"{owner}/{name}".lower() == full_name.lower():
+            return True
+    return False
+
+
+def api_reason(raw):
+    """A short reason code from an API's error answer, safe for the public log (never the request)."""
+    try:
+        body = json.loads(raw)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    err = body.get("error") if isinstance(body.get("error"), dict) else {}
+    codes = [e.get("reason") for e in (err.get("details") or []) + (err.get("errors") or [])
+             if isinstance(e, dict) and e.get("reason")]
+    return " ".join(dict.fromkeys(str(c) for c in codes))[:60] or str(err.get("status") or body.get("title") or "")[:60]
+
+
+def youtube(full_name, since, key):
+    """(200, videos posted since `since` whose description links the repo, most viewed first), or
+    (status, reason). One search (YouTube allows 100 a day) and one cheap call for the videos' details."""
+    owner, name = full_name.split("/", 1)
+    query = urllib.parse.urlencode({"part": "snippet", "type": "video", "q": f"{name} {owner}", "maxResults": 25,
+                                    "publishedAfter": f"{since.isoformat()}T00:00:00Z", "key": key})
+    status, raw = fetch("https://www.googleapis.com/youtube/v3/search?" + query, tries=2)
+    if status != 200:
+        return status, api_reason(raw)
+    try:
+        ids = [i["id"]["videoId"] for i in json.loads(raw).get("items") or [] if (i.get("id") or {}).get("videoId")]
+    except (ValueError, TypeError, AttributeError):
+        return 0, "unreadable answer"
+    if not ids:
+        return 200, []
+    query = urllib.parse.urlencode({"part": "snippet,statistics", "id": ",".join(ids), "key": key})
+    status, raw = fetch("https://www.googleapis.com/youtube/v3/videos?" + query, tries=2)
+    if status != 200:
+        return status, api_reason(raw)
+    videos = []
+    try:
+        for v in json.loads(raw).get("items") or []:
+            snip, stats = v.get("snippet") or {}, v.get("statistics") or {}
+            if links_repo(snip.get("description"), full_name) and snip.get("publishedAt"):
+                videos.append({"id": v["id"], "title": (snip.get("title") or "")[:150],
+                               "channel": (snip.get("channelTitle") or "")[:80],
+                               "published": snip["publishedAt"], "views": int(stats.get("viewCount") or 0)})
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return 0, "unreadable answer"
+    return 200, sorted(videos, key=lambda v: -v["views"])[:5]
+
+
+def x_posts(full_name, token):
+    """(200, {"week": posts, "days": [[UTC day, posts], ...]}): posts on X that linked the repo in the last
+    7 days, reposts not counted; or (status, reason). One prepaid count."""
+    query = urllib.parse.urlencode({"query": f'url:"github.com/{full_name}" -is:retweet', "granularity": "day"})
+    status, raw = fetch("https://api.x.com/2/tweets/counts/recent?" + query,
+                        {"Authorization": "Bearer " + token}, tries=2)
+    if status != 200:
+        return status, api_reason(raw)
+    try:
+        body = json.loads(raw)
+        days = [[d["start"][:10], int(d.get("tweet_count") or 0)] for d in body.get("data") or []]
+        week = int((body.get("meta") or {}).get("total_tweet_count") or sum(n for _, n in days))
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return 0, "unreadable answer"
+    return 200, {"week": week, "days": days}
+
+
+def reddit_threads(full_name, key):
+    """The Reddit test: (200, threads that link the repo) from Google's index of reddit.com, through the
+    owner's site search app (REDDIT_APP; $4 per 1,000 searches), or (status, reason)."""
+    project, app = REDDIT_APP.split("/", 1)
+    config = (f"projects/{project}/locations/global/collections/default_collection/engines/{app}"
+              "/servingConfigs/default_search")
+    body = json.dumps({"servingConfig": config, "query": f'"github.com/{full_name}"', "pageSize": 10,
+                       "userPseudoId": "truestars"}).encode()
+    status, raw = fetch(f"https://discoveryengine.googleapis.com/v1/{config}:searchLite?"
+                        + urllib.parse.urlencode({"key": key}), {"Content-Type": "application/json"}, body, tries=2)
+    if status != 200:
+        return status, api_reason(raw)
+    threads = []
+    try:
+        for result in json.loads(raw).get("results") or []:
+            found = (result.get("document") or {}).get("derivedStructData") or {}
+            sub = re.match(r"https://(?:www\.|old\.)?reddit\.com/r/(\w+)/comments/", found.get("link") or "")
+            if sub:
+                threads.append({"url": found["link"], "sub": sub.group(1), "title": (found.get("title") or "")[:150]})
+    except (ValueError, TypeError, AttributeError):
+        return 0, "unreadable answer"
+    return 200, threads
 
 
 # ----------------------------------------------------------------- collect
@@ -590,15 +705,16 @@ def heat(row, frac):
 
 # ----------------------------------------------------------------- history
 
-PAGE_ONLY = ("chart", "chart_start", "avatar", "image", "color", "heat_parts", "pace", "speedup")
+PAGE_ONLY = ("chart", "chart_start", "avatar", "image", "color", "heat_parts", "pace", "speedup", "social")
 
 
 def save_day(day, rows, data):
-    """The day's ranking as published. These files are the site's history."""
+    """The day's ranking as published. These files are the site's history: no YouTube or X data."""
     os.makedirs(DAYS, exist_ok=True)
     snapshot = {"day": day.isoformat(), "generated_at": data["generated_at"],
                 "repos_checked": len(data["repos"]),
-                "rows": [{k: v for k, v in r.items() if k not in PAGE_ONLY} for r in rows]}
+                "rows": [{k: ([w for w in v if w["kind"] not in SOCIAL_KINDS] if k == "why" else v)
+                          for k, v in r.items() if k not in PAGE_ONLY} for r in rows]}
     path = os.path.join(DAYS, f"{day.isoformat()}.json")
     with open(path + ".tmp", "w") as fh:
         json.dump(snapshot, fh, separators=(",", ":"))
@@ -731,6 +847,26 @@ def reasons_html(row):
     return "".join(f"<li>{esc(t)}</li>" for t in row["flags"] + row["notes"])
 
 
+def talk_html(row):
+    """Repo page: YouTube videos and posts on X that link the repo (the top repos, looked up daily)."""
+    found, parts = row.get("social") or {}, []
+    posts = (found.get("x") or {}).get("week") or 0
+    if posts:
+        parts.append(f'<p>X: <b>{posts:,} post{"s" if posts != 1 else ""}</b> linked it in the last 7 days, '
+                     f'reposts not counted. <a href="{esc(x_search(row["name"]))}" target="_blank" '
+                     f'rel="noopener">See them on X ↗</a></p>')
+    videos = (found.get("youtube") or {}).get("videos") or []
+    if videos:
+        items = "".join(
+            f'<li><a href="https://www.youtube.com/watch?v={esc(v["id"])}" target="_blank" rel="noopener">'
+            f'{esc(v["title"])}</a><span>{esc(v["channel"])} · {fmt_count(v["views"])} views · '
+            f'{fmt_day(v["published"])}</span></li>' for v in videos[:3])
+        parts.append(f'<h3>On YouTube</h3><ul class="vids">{items}</ul><p class="hint">Videos on YouTube whose '
+                     f'description links this repo. <a href="https://www.youtube.com/t/terms" target="_blank" '
+                     f'rel="noopener">YouTube Terms of Service</a></p>')
+    return f'<section class="card"><h2>Where people talk</h2>{"".join(parts)}</section>' if parts else ""
+
+
 def why_chips(row):
     chips = []
     for w in row["why"]:
@@ -771,8 +907,8 @@ def shell(title, body, root, description, updated, path=None, head=""):
 <main class="wrap">
 {body}
 </main>
-<footer class="wrap foot">TrueStars · updated {esc(updated)} · data from GitHub's API, GH Archive and Hacker News ·
-  not affiliated with GitHub</footer>
+<footer class="wrap foot">TrueStars · updated {esc(updated)} · data from GitHub's API, GH Archive, Hacker News, YouTube
+  and X · not affiliated with GitHub · <a href="{root}privacy/index.html">Privacy and terms</a></footer>
 </body>
 </html>
 """
@@ -981,6 +1117,7 @@ def render_repo(slug, entry, fresh, latest, updated):
       not proof. <a href="{root}how/index.html">How the check works</a></p>
   </section>
   {f'<section class="card"><h2>Why it may be trending</h2><div class="chips">{why_chips(row)}</div></section>' if row['why'] else ''}
+  {talk_html(row) if fresh else ''}
   <section class="card">
     <h2>Days in the ranking</h2>
     <ul class="ranks">{recent}</ul>
@@ -1077,6 +1214,9 @@ def render_how(updated):
     <ul>
       <li>a Hacker News post with {HN_MIN_POINTS}+ points in the last {HN_DAYS} days, with how much its stars
         jumped after it;</li>
+      <li>a YouTube video from the last {YT_DAYS} days with {YT_MIN_VIEWS:,}+ views whose description links the
+        repo, with how much its stars jumped after it;</li>
+      <li>{X_MIN_POSTS}+ posts on X that linked the repo in the last 7 days, reposts not counted;</li>
       <li>a release in the last week, shown only when a day after it brought at least {JUMP_X:g} times the repo's
         usual daily stars;</li>
       <li>a <b>wave</b>: {WAVE_MIN} or more repos in the ranking that share a GitHub topic, such as DeepSeek
@@ -1085,7 +1225,8 @@ def render_how(updated):
         ago”);</li>
       <li>an owner that is a well-known company or AI lab, or a person with {FOLLOWERS_MIN:,}+ followers.</li>
     </ul>
-    <p>Stars also come from places we can't see, such as X, Reddit, YouTube and newsletters, so a repo with no
+    <p>YouTube and X are checked once a day for the top {YT_TOP} and top {X_TOP} repos, through their official
+      APIs. Stars also come from places we can't see, such as Reddit, Discord and newsletters, so a repo with no
       reason shown may still have a good one.</p>
     <h2>The fake-star check</h2>
     <p>GitHub no longer shows who starred a repo, so the check uses what is still public. Real projects usually
@@ -1115,6 +1256,33 @@ def render_how(updated):
         "How TrueStars works", body, root,
         "How TrueStars ranks GitHub repos, tells rising from cooling, finds reasons and checks for fake stars.",
         updated, path="how/"))
+
+
+def render_privacy(updated):
+    """Privacy and terms. YouTube's API rules ask for a privacy policy and a link to YouTube's terms."""
+    root = "../"
+    body = f"""
+  <h1>Privacy and terms</h1>
+  <section class="prose">
+    <p>TrueStars has no accounts, sets no cookies and runs no ads or analytics. It collects nothing about you.
+      The site is hosted on GitHub Pages, and the Explore page loads repo and owner pictures from GitHub. GitHub
+      may log those visits, as
+      <a href="https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement">GitHub's
+      privacy statement</a> describes.</p>
+    <h2>YouTube and X</h2>
+    <p>Repo pages list YouTube videos that link a repo, found through the YouTube API Services, and count the
+      posts on X that link it, through X's API. By using TrueStars you agree to be bound by
+      <a href="https://www.youtube.com/t/terms">YouTube's Terms of Service</a>. Google's handling of YouTube data
+      is covered by the <a href="https://www.google.com/policies/privacy">Google Privacy Policy</a>. TrueStars
+      keeps YouTube and X data for at most {SOCIAL_KEEP_DAYS} days; repos near the top are looked up again every
+      day.</p>
+    <h2>Contact</h2>
+    <p>For questions, or to have something removed, open an issue at
+      <a href="https://github.com/truestars-dev/truestars/issues">github.com/truestars-dev/truestars</a>.</p>
+  </section>"""
+    write(os.path.join(SITE, "privacy", "index.html"), shell(
+        "Privacy and terms · TrueStars", body, root,
+        "TrueStars collects nothing about you. How it uses YouTube and X data.", updated, path="privacy/"))
 
 
 # ----------------------------------------------------------------- explore
@@ -1957,15 +2125,13 @@ def write(path, text):
         fh.write(text)
 
 
-def build():
-    with open(LATEST) as fh:
-        data = json.load(fh)
+def ranked(data):
+    """The listed repos, sorted and ranked as published. Also returns today (Pacific), when the data was
+    collected (Pacific time) and the share of today that had passed by then."""
     latest = dt.date.fromisoformat(data["latest_day"])
-    day = latest - dt.timedelta(days=1)  # the ranking day: the last complete Pacific day
     generated = dt.datetime.fromisoformat(data["generated_at"]).astimezone(PACIFIC)
     midnight = generated.replace(hour=0, minute=0, second=0, microsecond=0)
     frac = (generated - midnight).total_seconds() / 86400 if generated.date() == latest else 0.0
-
     rows = []
     for repo in data["repos"]:
         if not repo["meta"] or not repo["daily"] or repo["meta"]["isFork"]:
@@ -1984,6 +2150,117 @@ def build():
             r["rank"] = rank
         else:
             r["rank"] = None
+    return rows, latest, generated, frac
+
+
+def load_social():
+    """{slug: {"youtube": ..., "x": ...}}: this machine's copy, else the copy published with the site."""
+    try:
+        with open(SOCIAL) as fh:
+            return json.load(fh)["repos"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    status, raw = fetch(SOCIAL_URL, timeout=20, tries=2)
+    try:
+        return json.loads(raw)["repos"] if status == 200 else {}
+    except (ValueError, KeyError, TypeError):
+        return {}
+
+
+def social():
+    """YouTube videos and posts on X that link the top repos, looked up once a day per repo. Any refusal
+    (a wrong key, no credit left, a used-up quota) only stops that source for this run."""
+    with open(LATEST) as fh:
+        data = json.load(fh)
+    rows, latest, _, _ = ranked(data)
+    top = [r for r in rows if r["rank"]]
+    now = dt.datetime.now(dt.timezone.utc)
+    stamp = now.isoformat(timespec="seconds")
+    state = load_social()
+
+    def stale(slug, source):
+        at = ((state.get(slug) or {}).get(source) or {}).get("at")
+        return not at or (now - dt.datetime.fromisoformat(at)).total_seconds() > SOCIAL_FRESH_HOURS * 3600
+
+    def since(r):  # YouTube: videos posted after the repo was made, within YT_SEARCH_DAYS
+        return max(latest - dt.timedelta(days=r["age"] + 1), latest - dt.timedelta(days=YT_SEARCH_DAYS))
+
+    key, token = os.environ.get("GOOGLE_API_KEY", ""), os.environ.get("X_BEARER_TOKEN", "")
+    print("     YouTube and X for the top repos ...", flush=True)
+    for source, label, secret, limit, look in (
+            ("youtube", "YouTube", key, YT_TOP, lambda r: youtube(r["name"], since(r), key)),
+            ("x", "X", token, X_TOP, lambda r: x_posts(r["name"], token))):
+        if not secret:
+            print(f"     {label}: no key, skipped")
+            continue
+        todo = [r for r in top[:limit] if stale(r["slug"], source)]
+        done = found = 0
+        for r in todo:
+            status, result = look(r)
+            if status != 200:
+                print(f"     {label}: stopped after {done} of {len(todo)} lookups: HTTP {status} {result}".rstrip())
+                break
+            state.setdefault(r["slug"], {})[source] = dict(
+                {"at": stamp}, **({"videos": result} if source == "youtube" else result))
+            done += 1
+            found += bool(result if source == "youtube" else result["week"])
+        print(f"     {label}: {done} looked up, {found} with videos or posts that link the repo, "
+              f"{len(top[:limit]) - len(todo)} still fresh")
+    if key and REDDIT_APP:  # the Reddit test: the log shows whether Google's site search finds threads
+        for r in top[:5]:
+            status, result = reddit_threads(r["name"], key)
+            print(f"     Reddit test {r['name']}: HTTP {status} "
+                  + (f"{len(result)} threads" + (f", e.g. r/{result[0]['sub']}" if result else "")
+                     if status == 200 else str(result)))
+            if status != 200:
+                break
+    cutoff = now - dt.timedelta(days=SOCIAL_KEEP_DAYS)
+    kept = {}
+    for slug, entry in state.items():
+        entry = {s: v for s, v in entry.items() if s in SOCIAL_KINDS
+                 and dt.datetime.fromisoformat(v["at"]) > cutoff}
+        if entry:
+            kept[slug] = entry
+    write(SOCIAL, json.dumps({"generated_at": stamp, "about": (
+        f"YouTube and X data shown on TrueStars, looked up daily for the top repos and deleted after "
+        f"{SOCIAL_KEEP_DAYS} days. YouTube data comes from the YouTube API Services."), "repos": kept},
+        separators=(",", ":")))
+
+
+def social_chips(row, repo, latest):
+    """Reasons from YouTube and X, for the repos looked up in social()."""
+    chips, found = [], row["social"]
+    videos = [v for v in (found.get("youtube") or {}).get("videos") or []
+              if v["views"] >= YT_MIN_VIEWS and days_between(v["published"], latest) <= YT_DAYS]
+    if videos:
+        top = videos[0]
+        lift = jump(repo["daily"], pacific_day(top["published"]), latest - dt.timedelta(days=1),
+                    pacific_day(repo["meta"]["createdAt"]), 3) if repo else None
+        channel = top["channel"] if len(top["channel"]) <= 24 else top["channel"][:23] + "…"
+        chips.append({"kind": "youtube", "url": f"https://www.youtube.com/watch?v={top['id']}",
+                      "text": f"YouTube · {fmt_count(top['views'])} views · {channel} · {fmt_day(top['published'])}"
+                              + (f" · stars {fmt_x(lift)}" if lift else "")})
+    posts = (found.get("x") or {}).get("week") or 0
+    if posts >= X_MIN_POSTS:
+        chips.append({"kind": "x", "url": x_search(row["name"]), "text": f"X · {posts:,} posts in 7 days"})
+    return chips
+
+
+def x_search(full_name):
+    return "https://x.com/search?" + urllib.parse.urlencode({"q": f'url:"github.com/{full_name}"', "f": "live"})
+
+
+def build():
+    with open(LATEST) as fh:
+        data = json.load(fh)
+    rows, latest, generated, frac = ranked(data)
+    day = latest - dt.timedelta(days=1)  # the ranking day: the last complete Pacific day
+    rank = sum(1 for r in rows if r["rank"])
+    found = {}
+    if os.path.exists(SOCIAL):  # written by social() in this run
+        with open(SOCIAL) as fh:
+            found = json.load(fh)["repos"]
+    by_name = {r["meta"]["nameWithOwner"]: r for r in data["repos"] if r["meta"]}
     # Waves: GitHub topics shared by WAVE_MIN+ repos in the ranking; a repo shows the first one in WAVES
     listed = collections.Counter(w for r in rows if r["rank"] for w in r["waves"])
     for r in rows:
@@ -1991,6 +2268,8 @@ def build():
         if wave:
             r["why"].append({"kind": "wave", "text": f"Part of the {wave} wave · {listed[wave]} on the list",
                              "url": None})
+        r["social"] = found.get(r["slug"]) or {}
+        r["why"] += social_chips(r, by_name.get(r["name"]), latest)
         r["why"].sort(key=lambda w: WHY_ORDER.index(w["kind"]))
         r["heat"], r["heat_parts"], r["pace"], r["speedup"] = heat(r, frac)
     rising = sorted((r for r in rows if not r["flags"] and r["rising"]),  # no red flags; biggest gain first
@@ -2007,6 +2286,9 @@ def build():
           f'points="{star_points(10, 10.6, 9.5, 4)}"/></svg>')
     render_index(rows, rising, day, latest, data, updated)
     render_how(updated)
+    render_privacy(updated)
+    if os.path.exists(SOCIAL):  # published so the next run can read it back (social())
+        shutil.copyfile(SOCIAL, os.path.join(SITE, "social.json"))
     fresh = {r["slug"]: r for r in rows}
     for slug, entry in history.items():
         render_repo(slug, entry, fresh.get(slug), latest, updated)
@@ -2020,7 +2302,7 @@ def build():
         "Not found · TrueStars", '<h1>Page not found</h1><p>This repo has not been in the ranking yet. '
         '<a href="/index.html">See today\'s ranking</a>.</p>', "/", "Page not found.", updated))
     # Search engines: every page that rendered above, home and How first
-    pages = ["", "how/"] + [f"r/{slug}/" for slug in sorted(history)
+    pages = ["", "how/", "privacy/"] + [f"r/{slug}/" for slug in sorted(history)
                             if os.path.exists(os.path.join(SITE, "r", slug, "index.html"))]
     write(os.path.join(SITE, "sitemap.xml"),
           '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -2136,6 +2418,10 @@ a.chip:hover { text-decoration: underline; }
 .chart { width: 100%; height: 140px; display: block; }
 .axis { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin: 6px 0 0; }
 .hint { font-size: 13px; color: var(--muted); margin: 8px 0; }
+.card h3 { font-size: 14px; margin: 14px 0 6px; }
+.vids { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+.vids a { font-weight: 600; overflow-wrap: anywhere; }
+.vids span { display: block; color: var(--muted); font-size: 13px; }
 .ranks { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 8px; }
 .ranks li { background: var(--chip); border-radius: 8px; padding: 4px 10px; font-size: 13px;
   display: flex; gap: 8px; font-variant-numeric: tabular-nums; }
@@ -2148,6 +2434,7 @@ pre { background: var(--chip); border-radius: 8px; padding: 10px 12px; font-size
 .prose h2 { margin-top: 24px; }
 .prose li { margin-bottom: 4px; }
 .foot { color: var(--muted); font-size: 12px; padding-bottom: 32px; }
+.foot a { color: inherit; }
 @media (max-width: 760px) {
   .row { grid-template-columns: 28px 1fr; }
   .nums, .spark { grid-column: 2; }
@@ -2160,9 +2447,18 @@ pre { background: var(--chip); border-radius: 8px; padding: 10px 12px; font-size
 
 if __name__ == "__main__":
     step = sys.argv[1] if len(sys.argv) > 1 else "all"
-    if step not in ("all", "collect", "build"):
+    if step not in ("all", "collect", "social", "build"):
         sys.exit(__doc__)
     if step in ("all", "collect"):
         collect()
+    if step in ("all", "social"):
+        try:
+            social()
+        except Exception:  # YouTube and X must never keep the ranking from publishing
+            report = traceback.format_exc()
+            for secret in (os.environ.get("GOOGLE_API_KEY"), os.environ.get("X_BEARER_TOKEN")):
+                if secret:
+                    report = report.replace(secret, "***")
+            print("YouTube and X lookups failed; the site is built without new ones:\n" + report, file=sys.stderr)
     if step in ("all", "build"):
         build()
