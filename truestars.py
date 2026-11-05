@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TrueStars: the GitHub repos gaining stars fastest, checked for fake stars.
+"""TrueStars: the GitHub repos gaining stars fastest, where each one stands, why, and a fake-star check.
 
   python3 -I truestars.py           collect today's data, then build the site
   python3 -I truestars.py collect   only collect                  -> data/latest.json
@@ -40,7 +40,10 @@ MIN_REPOS = 50             # a run with fewer repos than this has failed; the la
 
 # Red flags: hints, not proof. Tuned on the 2026-11-02 run (253 listed repos).
 NEW_OWNER_DAYS = 90        # owner account younger than this
-RATIO_MIN_STARS = 300      # only judge ratios once a repo has this many stars
+RATIO_MIN_STARS = 300      # judge the issues ratio once a repo has this many stars
+SMALL_MIN_STARS = 50       # forks, watchers and commits from this many: the search for repos 1-3 days old
+                           # reaches 50 stars, and on 2026-11-04 it found ~45 new "full working installer"
+                           # repos at 200-300 stars with no forks, no watchers and one commit
 FORKS_PER_100 = 1.0        # fewer forks than this per 100 stars
 TALK_PER_1K = 0.5          # fewer issues + pull requests than this per 1,000 stars
 WATCHERS_PER_1K = 0.5      # fewer watchers than this per 1,000 stars
@@ -50,6 +53,39 @@ STOP_SHARE = 0.01          # every complete day from two days on stayed under th
 HIDE_AT_FLAGS = 2          # repos with this many flags are left out of the ranking (owner, 2026-11-03)
 HN_MIN_POINTS = 20         # a Hacker News post counts as a reason from this many points
 HN_DAYS = 14               # ... if it was posted within this many days
+
+# Direction: where a repo stands against its own best day (complete days only)
+RUN_SHARE = 0.10           # a run: the days in a row with at least this share of the repo's best day
+RISING_X = 1.5             # "Rising": this many times its mean over the 3 days before, and 20+ stars more
+COOLING_SHARE = 0.8        # "Cooling": under this share of its best day in the 7 days before
+# "Rising now" (research rule R2: it fired for 23 of the 11-03 top 30, a median 2 days before their peak)
+RISE_X = 3.0               # this many times its mean over the 7 days before (that mean counted as at
+RISE_FLOOR = 5             # least RISE_FLOOR), with at least RISE_MIN stars: on the last complete day,
+RISE_MIN = 50              # or at today's pace once RISE_FRAC of today has passed
+RISE_FRAC = 0.2
+RISE_LIST = 10             # repos in the "Rising now" list
+# More reasons a repo may be trending
+LAUNCHED_DAYS = 30         # "Launched N days ago" after the 14-day "Brand new" chip, up to this age
+FOLLOWERS_MIN = 1000       # an owner with this many followers gets a reach chip
+JUMP_X = 2.0               # a release or HN post counts when a day after it had this many times the
+                           # mean of the 7 days before it
+WAVE_MIN = 3               # a wave chip needs this many repos in the ranking that share it
+WAVES = [                  # (name, GitHub topics); the first wave that matches wins
+    ("DeepSeek Harness", {"deepseek-harness", "dsh", "dsh-plugin", "dsh-plugins"}),
+    ("agent skills", {"agent-skills", "agent-skill", "claude-skills", "claude-code-skills", "codex-skills"}),
+    ("Claude Code", {"claude-code", "claude-code-plugin", "claude-code-plugins"}),
+    ("Codex", {"codex", "codex-cli", "openai-codex"}),
+    ("MCP", {"mcp", "mcp-server", "mcp-servers", "model-context-protocol"}),
+    ("OpenClaw", {"openclaw"}),
+]
+BIG_ORGS = {               # well-known companies and AI labs (GitHub logins, lower case): "From <org>"
+    "google", "google-research", "google-deepmind", "microsoft", "github", "nvidia", "nvidia-omniverse",
+    "openai", "anthropics", "deepseek-ai", "meta-llama", "facebookresearch", "apple", "aws", "awslabs",
+    "alibaba", "qwenlm", "tencent", "tencent-hunyuan", "bytedance", "minimax-ai", "moonshotai", "mistralai",
+    "huggingface", "cloudflare", "vercel", "vercel-labs", "stripe", "spotify", "netflix", "shopify", "ibm",
+    "intel",
+}
+WHY_ORDER = ["hn", "release", "wave", "new", "org", "reach"]
 RISKY_ASSET = re.compile(r"\.(exe|msi|scr|bat|cmd|apk|dmg|pkg|rar|7z)$", re.I)
 
 _token = None
@@ -112,14 +148,32 @@ def graphql(query):
 
 # --------------------------------------------------------------- discovery
 
+def search_repos(query, limit=100):
+    """Repos matching a GitHub search, most stars first."""
+    status, data = github("/search/repositories", {
+        "q": query, "sort": "stars", "order": "desc", "per_page": min(limit, 100)})
+    if status != 200 or not data:
+        return []
+    return [item["full_name"] for item in data.get("items", [])][:limit]
+
+
 def from_new_repos(days, min_stars):
     """Repos created in the last `days` days with the most stars."""
     since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%d")
-    status, data = github("/search/repositories", {
-        "q": f"created:>={since} stars:>={min_stars}", "sort": "stars", "order": "desc", "per_page": 100})
-    if status != 200 or not data:
-        return []
-    return [item["full_name"] for item in data.get("items", [])]
+    return search_repos(f"created:>={since} stars:>={min_stars}")
+
+
+def from_last_days(days=3, min_stars=50, per_day=50):
+    """The most-starred repos created on each of the last few days (UTC dates).
+
+    The searches above stop at 100 results, which cut new repos off at about 300 stars: 73 of
+    the 100 biggest repos created on Nov 1-3, 2026 were missed. These find new risers early.
+    """
+    today = dt.datetime.now(dt.timezone.utc).date()
+    names = []
+    for k in range(days):
+        names += search_repos(f"created:{today - dt.timedelta(days=k)} stars:>={min_stars}", per_day)
+    return names
 
 
 def _gharchive_hour(hour):
@@ -180,6 +234,7 @@ REPO_FIELDS = """
   nameWithOwner url description homepageUrl createdAt pushedAt
   stargazerCount forkCount isFork isArchived hasIssuesEnabled
   primaryLanguage { name }
+  repositoryTopics(first: 10) { nodes { topic { name } } }
   watchers { totalCount }
   issues { totalCount }
   pullRequests { totalCount }
@@ -240,7 +295,7 @@ def collect():
     archive, hours_read = from_gharchive()
     sources = collections.OrderedDict()
     for label, names in (("new-30d", from_new_repos(30, 300)), ("new-7d", from_new_repos(7, 100)),
-                         ("gharchive", archive)):
+                         ("new-3d", from_last_days()), ("gharchive", archive)):
         for name in names:
             sources.setdefault(name.lower(), {"name": name, "sources": []})["sources"].append(label)
     names = [v["name"] for v in sources.values()]
@@ -313,8 +368,89 @@ def stopped_dead(daily, yday):
     return None
 
 
-def assess(repo, latest):
-    """Turn raw data into the numbers and plain-language notes on the pages."""
+def mean_before(daily, day, n=7):
+    """Mean stars a day over the n days before `day`, counted as at least RISE_FLOOR."""
+    return max(RISE_FLOOR, sum(daily.get((day - dt.timedelta(days=k)).isoformat(), 0) for k in range(1, n + 1)) / n)
+
+
+def jump(daily, day, yday, created, span):
+    """The best of `span` complete days from `day` against the mean of the 7 days before it.
+
+    None when that is under JUMP_X, or the repo had no full week before `day` (its launch
+    explains the stars then, and the "Brand new" chip says so).
+    """
+    if (day - created).days < 7 or day > yday:
+        return None
+    before = mean_before(daily, day)
+    after = max(daily.get((day + dt.timedelta(days=k)).isoformat(), 0) for k in range(min(span, (yday - day).days + 1)))
+    return after / before if after >= JUMP_X * before else None
+
+
+def direction(counts, start, full):
+    """Where a repo stands against its own best day, from complete days only.
+
+    counts: stars per day from `start` (its creation, or the first day fetched) to the ranking day.
+    full: True when `start` is the creation day, so the best day is the best day ever.
+    """
+    if not counts or not max(counts):
+        return None
+    y, prev = counts[-1], counts[:-1]
+    best = max(counts)
+    best_i = counts.index(best)
+    run = 0  # the days in a row, up to the ranking day, with at least RUN_SHARE of the best day
+    for c in reversed(counts):
+        if c < max(1, RUN_SHARE * best):
+            break
+        run += 1
+    if run == len(counts) and not full:
+        run = None  # it began before the first day fetched
+    hot, waves = False, 0  # waves: runs of days at half the best day or more, each ending below a quarter
+    for c in counts:
+        if not hot and c >= best / 2:
+            hot, waves = True, waves + 1
+        elif hot and c < best / 4:
+            hot = False
+    wave = waves if best >= 100 and hot and waves >= 2 else 0  # 2 = its second wave, and so on
+    avg3 = sum(prev[-3:]) / len(prev[-3:]) if prev else 0
+    if not prev or y >= max(prev):
+        state = "peak"
+    elif y >= RISING_X * avg3 and y - avg3 >= 20:
+        state = "rising"
+    elif y < COOLING_SHARE * max(prev[-7:]):
+        state = "cooling"
+    else:
+        state = "steady"
+    half = next((k for k in range(1, len(counts) - best_i) if counts[best_i + k] < best / 2), None)
+    return {"state": state, "best": best, "best_day": (start + dt.timedelta(days=best_i)).isoformat(),
+            "share": round(100 * y / best), "run": run, "full": full, "half": half, "wave": wave}
+
+
+def rising_now(daily, latest, frac, created):
+    """Acceleration against the repo's own 7 days before, or None when it is not rising now.
+
+    Checks the last complete day, and today's pace once RISE_FRAC of today has passed
+    (today wins: it is fresher). "x" is how many times its usual daily stars.
+    """
+    yday = latest - dt.timedelta(days=1)
+    found = None
+    y = daily.get(yday.isoformat(), 0)
+    if y >= RISE_MIN and y >= RISE_X * mean_before(daily, yday):
+        found = {"when": "day", "stars": y, "rate": y, "base": mean_before(daily, yday)}
+    t = daily.get(latest.isoformat(), 0)
+    if frac >= RISE_FRAC and t / frac >= RISE_MIN and t / frac >= RISE_X * mean_before(daily, latest):
+        found = {"when": "today", "stars": t, "rate": round(t / frac), "base": mean_before(daily, latest)}
+    if found:
+        found["x"] = round(found["rate"] / found["base"], 1)
+        found["base"] = round(found["base"], 1)
+        found["new"] = (latest - created).days <= 7  # no full week before it: the times figure means little
+    return found
+
+
+def assess(repo, latest, frac):
+    """Turn raw data into the numbers and plain-language notes on the pages.
+
+    frac: the share of today (Pacific) that had passed when the data was collected.
+    """
     meta, daily = repo["meta"], repo["daily"]
     yday = latest - dt.timedelta(days=1)
     stars = meta["stargazerCount"] or 0
@@ -329,10 +465,10 @@ def assess(repo, latest):
     release = (meta["releases"]["nodes"] or [None])[0]
 
     flags, context = [], []
-    if stars >= RATIO_MIN_STARS:
+    if stars >= SMALL_MIN_STARS:
         if forks * 100 < FORKS_PER_100 * stars:
             flags.append(f"Very few forks for its stars ({forks:,} fork{'s' if forks != 1 else ''})")
-        if meta["hasIssuesEnabled"] and talk * 1000 < TALK_PER_1K * stars:
+        if stars >= RATIO_MIN_STARS and meta["hasIssuesEnabled"] and talk * 1000 < TALK_PER_1K * stars:
             flags.append(f"Almost no issues or pull requests ({talk:,})")
         if watchers * 1000 < WATCHERS_PER_1K * stars:
             flags.append(f"Very few people watching it ({watchers:,})")
@@ -343,6 +479,8 @@ def assess(repo, latest):
         flags.append(f"Stars stopped dead: {stop[0]:,} on {fmt_day(stop[1].isoformat())}, then almost none")
     if owner_age is not None and owner_age < NEW_OWNER_DAYS:
         context.append(f"Owner's account is only {owner_age} days old")
+    if owner.get("__typename") == "User" and not (owner.get("followers") or {}).get("totalCount"):
+        context.append("Owner has no followers")
 
     notes = []
     if flags:
@@ -352,21 +490,40 @@ def assess(repo, latest):
     if release and any(RISKY_ASSET.search(a["name"]) for a in release["releaseAssets"]["nodes"]):
         notes.append("Offers program downloads; check before installing")
 
-    why = []
+    created = pacific_day(meta["createdAt"])
+    first = min(dt.date.fromisoformat(k) for k in daily)
+    start = max(first, created)  # the first day that counts: its creation, or the first day fetched
+    counts = [daily.get((start + dt.timedelta(days=k)).isoformat(), 0) for k in range((yday - start).days + 1)]
+    topics = [n["topic"]["name"] for n in ((meta.get("repositoryTopics") or {}).get("nodes") or [])
+              if n and n.get("topic")]
+
+    why = []  # kinds in WHY_ORDER; build() adds the wave chips, which need the whole list
     recent_hn = [s for s in (repo["hn"] or []) if s["date"] and s["points"] >= HN_MIN_POINTS
                  and days_between(s["date"], latest) <= HN_DAYS]
     if recent_hn:
         top = max(recent_hn, key=lambda s: s["points"])
-        why.append({"text": f"Hacker News · {top['points']:,} points · {fmt_day(top['date'])}",
-                    "url": f"https://news.ycombinator.com/item?id={top['id']}"})
+        lift = jump(daily, pacific_day(top["date"]), yday, created, 3)
+        why.append({"kind": "hn", "url": f"https://news.ycombinator.com/item?id={top['id']}",
+                    "text": f"Hacker News · {top['points']:,} points · {fmt_day(top['date'])}"
+                            + (f" · stars {fmt_x(lift)}" if lift else "")})
     if release and release.get("publishedAt") and days_between(release["publishedAt"], latest) <= 7:
-        why.append({"text": f"New release {release['tagName']} · {fmt_day(release['publishedAt'])}",
-                    "url": release["url"]})
+        lift = jump(daily, pacific_day(release["publishedAt"]), yday, created, 2)
+        if lift:  # active repos release all the time; a release explains stars only when they jumped
+            why.append({"kind": "release", "url": release["url"],
+                        "text": f"New release {release['tagName']} · {fmt_day(release['publishedAt'])}"
+                                f" · stars {fmt_x(lift)}"})
     if repo_age <= 14:
-        why.append({"text": f"Brand new · created {fmt_day(meta['createdAt'])}", "url": None})
+        why.append({"kind": "new", "text": f"Brand new · created {fmt_day(meta['createdAt'])}", "url": None})
+    elif repo_age <= LAUNCHED_DAYS:
+        why.append({"kind": "new", "text": f"Launched {repo_age} days ago", "url": None})
+    if owner.get("__typename") == "Organization" and (owner.get("login") or "").lower() in BIG_ORGS:
+        why.append({"kind": "org", "text": f"From {owner['login']}", "url": None})
+    followers = (owner.get("followers") or {}).get("totalCount") or 0
+    if followers >= FOLLOWERS_MIN:
+        shown = f"{followers:,}" if followers < 10_000 else f"{followers // 1000:,}k"
+        why.append({"kind": "reach", "text": f"Owner has {shown} followers", "url": None})
 
-    first = min(dt.date.fromisoformat(k) for k in daily)
-    chart_start = max(first, pacific_day(meta["createdAt"]), latest - dt.timedelta(days=89))
+    chart_start = max(start, latest - dt.timedelta(days=89))
     week = day_total(daily, yday, 7)
     return {
         "slug": slug_of(meta["nameWithOwner"]),
@@ -383,6 +540,10 @@ def assess(repo, latest):
         "chart": [daily.get((chart_start + dt.timedelta(days=k)).isoformat(), 0)
                   for k in range((latest - chart_start).days + 1)],
         "flags": flags, "notes": notes, "why": why,
+        "age": repo_age, "topics": topics,
+        "waves": [name for name, tags in WAVES if tags.intersection(topics)],
+        "direction": direction(counts, start, created >= first),
+        "rising": rising_now(daily, latest, frac, created),
     }
 
 
@@ -438,8 +599,63 @@ def fmt_count(n):
     return f"{n:,}"
 
 
+def fmt_x(x):
+    """3.0 -> ×3, 2.45 -> ×2.5, 14.2 -> ×14"""
+    return "×" + (f"{x:.1f}".rstrip("0").rstrip(".") if x < 10 else f"{x:.0f}")
+
+
 def esc(text):
     return html.escape(str(text), quote=True)
+
+
+DIR_LABEL = {"peak": "At its peak", "rising": "Rising", "steady": "Steady", "cooling": "Cooling"}
+WAVE_WORD = {2: "second wave", 3: "third wave"}
+
+
+def dir_parts(d):
+    """The direction label and its short detail, e.g. ("Cooling", "46% of its Oct 30 peak")."""
+    label = "At a 3-month high" if d["state"] == "peak" and not d["full"] else DIR_LABEL[d["state"]]
+    if d["state"] == "cooling":
+        return label, f"{d['share']}% of its {fmt_day(d['best_day'])} {'peak' if d['full'] else 'high'}"
+    detail = [WAVE_WORD.get(d["wave"], "another wave")] if d["wave"] else []
+    if d["run"] and d["run"] <= 60:
+        detail.append(f"day {d['run']} of its run")
+    return label, " · ".join(detail)
+
+
+def dir_html(row):
+    d = row.get("direction")
+    if not d:
+        return ""
+    label, detail = dir_parts(d)
+    return f'<span class="dir dir-{d["state"]}">{esc(label)}{" · " + esc(detail) if detail else ""}</span>'
+
+
+def where_it_stands(row, latest):
+    """The repo page's card on direction: its best day, how far it is from it, its run."""
+    d = row.get("direction")
+    if not d:
+        return ""
+    yday = fmt_day((latest - dt.timedelta(days=1)).isoformat())
+    facts = [f"Best day{'' if d['full'] else ' in the last 13 weeks'}: +{d['best']:,} stars on "
+             f"{fmt_day(d['best_day'])}."]
+    if d["state"] != "peak":
+        facts.append(f"{yday}: {d['share']}% of that.")
+    if d["half"] is not None:
+        facts.append(f"It fell below half of its best day {d['half']} day{'s' if d['half'] != 1 else ''} later.")
+    if d["run"]:
+        facts.append(f"Day {d['run']} of its run (the days in a row with at least a tenth of its best day).")
+    if d["wave"]:
+        facts.append("Back above half its best day after dropping below a quarter of it: "
+                     f"its {WAVE_WORD.get(d['wave'], 'latest wave')}.")
+    x = row.get("rising")
+    if x:
+        when = "so far today" if x["when"] == "today" else f"on {yday}"
+        facts.append(("Brand new and rising fast" if x["new"] else
+                      f"Rising now: {fmt_x(x['x'])} its usual daily stars") + f" (+{x['stars']:,} {when}).")
+    items = "".join(f"<li>{esc(f)}</li>" for f in facts)
+    return (f'<section class="card"><h2>Where it stands</h2><p>{dir_html(row)}</p>'
+            f'<ul class="facts">{items}</ul></section>')
 
 
 def bars(values, first_day, width, height, gap, label_cls=""):
@@ -530,10 +746,31 @@ STAR_ICON = (f'<svg class="star" viewBox="0 0 20 20" aria-hidden="true">'
              f'<polygon points="{star_points(10, 10.6, 9.5, 4)}"/></svg>')
 
 
-def render_index(rows, day, latest, data, updated):
+def render_rising(rising, day):
+    """The "Rising now" list at the top of the ranking."""
+    items = []
+    for r in rising:
+        x = r["rising"]
+        how = "brand new" if x["new"] else f"accelerating {fmt_x(x['x'])}"
+        when = (f"+{x['stars']:,} so far today" if x["when"] == "today"
+                else f"+{x['stars']:,} on {fmt_day(day.isoformat())}")
+        link = (f'href="r/{esc(r["slug"])}/index.html"' if r["rank"]  # no page yet: not ranked on a full day
+                else f'href="{esc(r["url"])}" target="_blank" rel="noopener"')
+        items.append(f'<li><a class="name" {link}>{esc(r["name"])}</a>'
+                     f'<span class="accel">{how}</span><span class="when">{when}</span></li>')
+    found = f'<ol>{"".join(items)}</ol>' if items else '<p class="hint">Nothing in the ranking is speeding up right now.</p>'
+    return f"""<section class="rising" aria-labelledby="rising-h">
+    <h2 id="rising-h">Rising now</h2>
+    <p class="hint">Getting at least {RISE_X:g}× their usual daily stars, on {fmt_day(day.isoformat())} or at
+      today's pace so far. Updated twice a day. <a href="how/index.html#rising-now">How it's measured</a></p>
+    {found}
+  </section>"""
+
+
+def render_index(rows, rising, day, latest, data, updated):
     root = ""
     today_label = fmt_day(latest.isoformat()) + (" so far" if latest >= dt.datetime.now(PACIFIC).date() else "")
-    hidden = sum(1 for r in rows if not r["rank"])
+    hidden = sum(1 for r in rows if len(r["flags"]) >= HIDE_AT_FLAGS)
     items = []
     for r in rows:
         cls, text = verdict(r)
@@ -551,7 +788,7 @@ def render_index(rows, day, latest, data, updated):
       <a class="gh" href="{esc(r['url'])}" target="_blank" rel="noopener">GitHub ↗</a>
     </div>
     <p class="desc">{esc(r['description'][:220])}</p>
-    <div class="chips">{why_chips(r)}</div>
+    <div class="chips">{dir_html(r)}{why_chips(r)}</div>
     <details class="verdict verdict-{cls}"{'' if reasons else ' data-empty'}>
       <summary>{text}</summary>{f'<ul>{reasons}</ul>' if reasons else ''}
     </details>
@@ -565,11 +802,13 @@ def render_index(rows, day, latest, data, updated):
   {bars(r['spark'], (latest - dt.timedelta(days=14)).isoformat(), 120, 30, 2, 'spark')}
 </li>""")
     body = f"""
-  <h1>The GitHub repos gaining stars fastest, checked for fake stars</h1>
+  <h1>The GitHub repos gaining stars fastest, and why</h1>
   <div class="summary">Ranked by stars gained on <b>{fmt_day(day.isoformat())}</b> (a full day, US Pacific time),
-    from {len(data['repos'])} fast-growing repos. <b>{hidden}</b> repos with two or more red flags are left out of
-    the ranking; see them under “Has red flags”. Red flags are hints, not proof.
+    from {len(data['repos'])} fast-growing repos. Each shows whether it is rising, at its peak or cooling, and the
+    reasons we can see. <b>{hidden}</b> repos with two or more red flags for fake stars are left out of the
+    ranking; see them under “Has red flags”. Red flags are hints, not proof.
     <a href="how/index.html">How it works</a></div>
+  {render_rising(rising, day)}
   <div class="controls">
     <span class="label">Rank by</span>
     <div class="seg" id="sort">
@@ -588,9 +827,9 @@ def render_index(rows, day, latest, data, updated):
   <ol id="list">{''.join(items)}</ol>
   <script>{INDEX_JS}</script>"""
     write(os.path.join(SITE, "index.html"), shell(
-        "TrueStars: GitHub repos gaining stars fastest, checked for fake stars", body, root,
-        "Daily ranking of the GitHub repos gaining stars fastest, with every repo checked for signs of fake stars.",
-        updated, path=""))
+        "TrueStars: the GitHub repos gaining stars fastest, and why", body, root,
+        "Daily ranking of the GitHub repos gaining stars fastest: whether each is rising or cooling, why it may be "
+        "trending, and a check for fake stars.", updated, path=""))
 
 
 INDEX_JS = """
@@ -682,6 +921,7 @@ def render_repo(slug, entry, fresh, latest, updated):
     <div><b>+{fmt_count(row['week'])}</b><span>stars in 7 days</span></div>
     <div><b>{fmt_count(row['stars'])}</b><span>total stars</span></div>
   </div>
+  {where_it_stands(row, latest) if fresh else ''}
   <section class="card">
     <h2>Stars per day</h2>
     {chart}
@@ -710,7 +950,8 @@ def render_repo(slug, entry, fresh, latest, updated):
   <script>{COPY_JS}</script>"""
     write(os.path.join(SITE, "r", slug, "index.html"), shell(
         f"{row['name']} on TrueStars", body, root,
-        f"{row['name']}: daily stars, best rank #{best} and a fake-star check.", updated,
+        f"{row['name']}: daily stars, whether it is rising or cooling, best rank #{best} and a fake-star check.",
+        updated,
         path=f"r/{slug}/"))
 
 
@@ -755,14 +996,52 @@ def render_how(updated):
   <h1>How TrueStars works</h1>
   <section class="prose">
     <h2>What it ranks</h2>
-    <p>Every day TrueStars ranks the GitHub repos that gained the most stars the day before, and checks each one
-      for signs that its stars are not real. Days run midnight to midnight US Pacific time, the same days
-      GitHub uses.</p>
+    <p>Every day TrueStars ranks the GitHub repos that gained the most stars the day before. It shows whether
+      each one is rising, at its peak or cooling, the reasons it may be trending that we can see, and a check for
+      signs that its stars are not real. Days run midnight to midnight US Pacific time, the same days GitHub
+      uses.</p>
     <h2>Where the numbers come from</h2>
-    <p><b>Finding repos.</b> Each run looks at new repos with the most stars this month and this week (GitHub
-      search), and at the repos starred most often in the last 24 hours of GH Archive, a public log of GitHub
-      activity. GH Archive now records only a sample of stars, so it is used only to find repos, never to count.</p>
+    <p><b>Finding repos.</b> Each run looks at new repos with the most stars this month and this week, and at
+      the most-starred repos created on each of the last three days, so new risers show up early (GitHub
+      search). It also looks at the repos starred most often in the last 24 hours of GH Archive, a public log of
+      GitHub activity. GH Archive now records only a sample of stars, so it is used only to find repos, never to
+      count.</p>
     <p><b>Counting stars.</b> Daily star counts come from GitHub's star-history API, so they are exact.</p>
+    <h2 id="direction">Rising, at its peak, steady or cooling</h2>
+    <p>Each repo is compared with its own best day, using full days only:</p>
+    <ul>
+      <li><b>At its peak</b>: the ranking day was its best day so far. We keep 13 weeks of daily counts, so for an
+        older repo it says <b>At a 3-month high</b>.</li>
+      <li><b>Rising</b>: below its best day, but at least {RISING_X:g} times its average over the 3 days before,
+        and at least 20 stars more.</li>
+      <li><b>Cooling</b>: under {COOLING_SHARE:.0%} of its best day in the 7 days before.</li>
+      <li><b>Steady</b>: none of these.</li>
+    </ul>
+    <p>A <b>run</b> is the days in a row with at least {RUN_SHARE:.0%} of the repo's best day: “day 4 of its run”
+      counts them. A <b>second wave</b> means it is back above half its best day after dropping below a quarter of
+      it. Most runs are short: in our data a new repo's best day comes a median of 2 days after it is created, and
+      half of that is gone 2 days later.</p>
+    <h2 id="rising-now">Rising now</h2>
+    <p>The list at the top of the ranking shows repos getting at least {RISE_X:g} times their usual daily stars
+      (their average over the 7 days before, counted as at least {RISE_FLOOR}), and at least {RISE_MIN} stars: on
+      the last full day, or at today's pace once a fifth of the day has passed. It is refreshed on both daily
+      updates. Tested on our own history, this rule picked out 23 of Nov 3's top 30 a median of two days before
+      their best day. It says a repo is speeding up, not that it will trend.</p>
+    <h2>Why a repo may be trending</h2>
+    <p>Each repo shows the reasons we can see:</p>
+    <ul>
+      <li>a Hacker News post with {HN_MIN_POINTS}+ points in the last {HN_DAYS} days, with how much its stars
+        jumped after it;</li>
+      <li>a release in the last week, shown only when a day after it brought at least {JUMP_X:g} times the repo's
+        usual daily stars;</li>
+      <li>a <b>wave</b>: {WAVE_MIN} or more repos in the ranking that share a GitHub topic, such as DeepSeek
+        Harness, agent skills or Claude Code;</li>
+      <li>a repo created in the last two weeks (“Brand new”) or the last {LAUNCHED_DAYS} days (“Launched N days
+        ago”);</li>
+      <li>an owner that is a well-known company or AI lab, or a person with {FOLLOWERS_MIN:,}+ followers.</li>
+    </ul>
+    <p>Stars also come from places we can't see, such as X, Reddit, YouTube and newsletters, so a repo with no
+      reason shown may still have a good one.</p>
     <h2>The fake-star check</h2>
     <p>GitHub no longer shows who starred a repo, so the check uses what is still public. Real projects usually
       draw forks, watchers and issues along with their stars; bought stars usually come alone. A repo gets a red
@@ -774,14 +1053,13 @@ def render_how(updated):
       <li>its stars stopped dead: a day with {STOP_MIN_PEAK}+ stars, then, within two days, under
         {STOP_SHARE * 100:g}% of that a day. Real interest fades over several days.</li>
     </ul>
-    <p>The first three are checked from {RATIO_MIN_STARS} stars up. An owner account younger than
-      {NEW_OWNER_DAYS} days, or fewer than {MIN_COMMITS} commits, is normal for an honest launch, so those count
-      only when one of the checks above also fails.</p>
-    <p>Repos with {HIDE_AT_FLAGS} or more red flags are left out of the ranking but stay visible under “Has red
-      flags”. <b>A flag is a reason to look closer, not proof of cheating.</b> We never call a repo fake.</p>
-    <h2>Why a repo may be trending</h2>
-    <p>Each repo shows the reasons we can see: a Hacker News post with {HN_MIN_POINTS}+ points in the last
-      {HN_DAYS} days, a release in the last week, or a repo created in the last two weeks.</p>
+    <p>Forks and watchers are checked from {SMALL_MIN_STARS} stars up, issues and pull requests from
+      {RATIO_MIN_STARS}. An owner account younger than {NEW_OWNER_DAYS} days, an owner with no followers, or fewer
+      than {MIN_COMMITS} commits is normal for an honest launch, so those count only when one of the checks above
+      also fails.</p>
+    <p>Repos with {HIDE_AT_FLAGS} or more red flags are left out of the ranking. Those with {RATIO_MIN_STARS} stars
+      or more stay visible under “Has red flags”. <b>A flag is a reason to look closer, not proof of
+      cheating.</b> We never call a repo fake.</p>
     <h2>The badge</h2>
     <p>Every repo that makes the ranking gets a page and a badge showing its best daily rank. The badge updates
       itself every day. Copy it from the repo's page.</p>
@@ -790,7 +1068,8 @@ def render_how(updated):
   </section>"""
     write(os.path.join(SITE, "how", "index.html"), shell(
         "How TrueStars works", body, root,
-        "How TrueStars counts stars, checks for fake stars and ranks GitHub repos.", updated, path="how/"))
+        "How TrueStars ranks GitHub repos, tells rising from cooling, finds reasons and checks for fake stars.",
+        updated, path="how/"))
 
 
 def write(path, text):
@@ -804,35 +1083,49 @@ def build():
         data = json.load(fh)
     latest = dt.date.fromisoformat(data["latest_day"])
     day = latest - dt.timedelta(days=1)  # the ranking day: the last complete Pacific day
+    generated = dt.datetime.fromisoformat(data["generated_at"]).astimezone(PACIFIC)
+    midnight = generated.replace(hour=0, minute=0, second=0, microsecond=0)
+    frac = (generated - midnight).total_seconds() / 86400 if generated.date() == latest else 0.0
 
     rows = []
     for repo in data["repos"]:
         if not repo["meta"] or not repo["daily"] or repo["meta"]["isFork"]:
             continue
-        row = assess(repo, latest)
+        row = assess(repo, latest, frac)
         if row["week"] < 50 and row["today"] < 20:
             continue
+        if len(row["flags"]) >= HIDE_AT_FLAGS and row["stars"] < RATIO_MIN_STARS:
+            continue  # small and flagged, mostly installer spam: not even listed under "Has red flags"
         rows.append(row)
     rows.sort(key=lambda r: (-r["yesterday"], r["name"].lower()))
     rank = 0
-    for r in rows:
-        if len(r["flags"]) < HIDE_AT_FLAGS:
+    for r in rows:  # ranked: fewer than HIDE_AT_FLAGS flags and stars on the ranking day (not just today)
+        if len(r["flags"]) < HIDE_AT_FLAGS and r["yesterday"] > 0:
             rank += 1
             r["rank"] = rank
         else:
             r["rank"] = None
+    # Waves: GitHub topics shared by WAVE_MIN+ repos in the ranking; a repo shows the first one in WAVES
+    listed = collections.Counter(w for r in rows if r["rank"] for w in r["waves"])
+    for r in rows:
+        wave = next((w for w in r["waves"] if listed[w] >= WAVE_MIN), None)
+        if wave:
+            r["why"].append({"kind": "wave", "text": f"Part of the {wave} wave · {listed[wave]} on the list",
+                             "url": None})
+        r["why"].sort(key=lambda w: WHY_ORDER.index(w["kind"]))
+    rising = sorted((r for r in rows if not r["flags"] and r["rising"]),  # no red flags; biggest gain first
+                    key=lambda r: (r["rising"]["base"] - r["rising"]["rate"], r["name"].lower()))[:RISE_LIST]
     save_day(day, rows, data)
     history = load_history()
 
     if os.path.isdir(SITE):
         shutil.rmtree(SITE)  # rebuilt from scratch every run
-    generated = dt.datetime.fromisoformat(data["generated_at"]).astimezone(PACIFIC)
     updated = f"{generated:%b} {generated.day}, {generated:%-I:%M %p} Pacific"
     write(os.path.join(SITE, "style.css"), STYLE)
     write(os.path.join(SITE, "favicon.svg"),
           f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><polygon fill="#2c55c9" '
           f'points="{star_points(10, 10.6, 9.5, 4)}"/></svg>')
-    render_index(rows, day, latest, data, updated)
+    render_index(rows, rising, day, latest, data, updated)
     render_how(updated)
     fresh = {r["slug"]: r for r in rows}
     for slug, entry in history.items():
@@ -860,6 +1153,7 @@ STYLE = """
   --accent: #2c55c9; --chip: #efede7; --gold: #f5c242;
   --good: #1d6b44; --good-bg: #e3f2e9; --warn: #8a5800; --warn-bg: #fbefd5;
   --bad: #a3261b; --bad-bg: #fbe4e1; --bar: #2c55c9; --bar-today: #a8b9ea; --bar-zero: #dcd8cf;
+  --accent-bg: #e6ecfa; --cool: #4f5f7a; --cool-bg: #e8ecf2;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -867,6 +1161,7 @@ STYLE = """
     --accent: #87a6ff; --chip: #26282c;
     --good: #79d3a0; --good-bg: #15301f; --warn: #f0c46c; --warn-bg: #33270e;
     --bad: #ff9187; --bad-bg: #3b1714; --bar: #87a6ff; --bar-today: #3d4c78; --bar-zero: #303236;
+    --accent-bg: #1f2945; --cool: #a9b7d0; --cool-bg: #242a35;
   }
 }
 * { box-sizing: border-box; }
@@ -910,6 +1205,23 @@ ol { list-style: none; margin: 0; padding: 0; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--chip);
   color: var(--ink); text-decoration: none; white-space: nowrap; }
 a.chip:hover { text-decoration: underline; }
+.dir { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.dir-peak { background: var(--accent-bg); color: var(--accent); }
+.dir-rising { background: var(--good-bg); color: var(--good); }
+.dir-steady { background: var(--chip); color: var(--muted); }
+.dir-cooling { background: var(--cool-bg); color: var(--cool); }
+.dir-peak::before { content: "▲ "; } .dir-rising::before { content: "↑ "; }
+.dir-steady::before { content: "→ "; } .dir-cooling::before { content: "↓ "; }
+.rising { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 14px 16px; margin-bottom: 20px; }
+.rising h2 { margin-bottom: 2px; }
+.rising .hint { margin: 0 0 10px; }
+.rising ol { display: grid; gap: 6px; }
+.rising li { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
+.accel { font-size: 12px; font-weight: 600; color: var(--good); }
+.when { font-size: 12px; color: var(--muted); }
+.facts { margin: 10px 0 0; padding-left: 18px; font-size: 14px; }
+.facts li { margin-bottom: 4px; }
 .verdict summary { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px;
   border-radius: 6px; cursor: pointer; list-style: none; }
 .verdict summary::-webkit-details-marker { display: none; }
@@ -954,6 +1266,7 @@ pre { background: var(--chip); border-radius: 8px; padding: 10px 12px; font-size
 @media (max-width: 760px) {
   .row { grid-template-columns: 28px 1fr; }
   .nums, .spark { grid-column: 2; }
+  .chip, .dir { white-space: normal; }
   .stats { grid-template-columns: repeat(2, 1fr); }
   h1 { font-size: 22px; }
 }

@@ -1,12 +1,15 @@
 # TrueStars
 
-The GitHub repos gaining stars fastest, checked for fake stars. Live at https://truestars.dev
+The GitHub repos gaining stars fastest, and why. Live at https://truestars.dev
 
 - **Exact daily stars** from GitHub's star-history API.
 - **A fake-star check** on every repo: forks, watchers and issues that keep up with the stars, and stars that
   fade instead of stopping dead. Repos with two or more red flags are left out of the ranking.
   A flag is a reason to look closer, not proof.
-- **Why it may be trending:** Hacker News posts, new releases, brand-new repos.
+- **Where each repo stands:** rising, at its peak, steady or cooling against its own best day, and a
+  "Rising now" list of repos getting at least 3 times their usual daily stars.
+- **Why it may be trending:** Hacker News posts and releases that moved the stars, waves of repos that
+  share a GitHub topic, brand-new and recent launches, well-known owners.
 - **A badge** for every repo that makes the ranking, showing its best daily rank.
 
 How the ranking and the check work: https://truestars.dev/how/
