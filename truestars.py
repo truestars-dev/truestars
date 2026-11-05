@@ -117,17 +117,20 @@ REDDIT_APP = ""            # the Reddit test: "<Google Cloud project id>/<site s
 CHART_HN_MIN = 5           # Hacker News posts with this many points are marked on the star charts
 TALK_DAYS = 30             # "Where people talk": Hacker News posts from this many days
 # The AI step (OpenAI): use cases and "What's the hype about" for Explore's hottest repos, and pictures for
-# the big cards. Off until the owner adds the OPENAI_API_KEY secret and picks a picture model from private
-# samples. "samples" writes them for the top AI_SAMPLE_REPOS to ai-samples/ (a workflow artifact, never the
-# site), on a code push or a manual run only; "on" puts the notes and pictures on the site.
-AI_MODE = "off"            # off | samples | on
+# the big cards. The owner picked GPT Image 2.6 for the pictures (2026-11-05); private samples compare its
+# Flare and Sunburst versions before anything goes on the site. "samples" writes them for the top
+# AI_SAMPLE_REPOS to ai-samples/ (a workflow artifact, never the site), on a code push or a manual run only;
+# "on" puts the notes and pictures on the site.
+AI_MODE = "samples"        # off | samples | on
 AI_TEXT_MODEL = "gpt-6-luna"           # OpenAI's model "for focused, high-volume tasks"
-AI_IMAGE_MODEL = "gpt-image-2.5-flare"
+AI_IMAGE_MODEL = "gpt-image-2.6-flare"
 AI_SAMPLE_TEXT_MODELS = ("gpt-6-luna", "gpt-6.1-terra")
-AI_SAMPLE_IMAGE_MODELS = ("gpt-image-2.5-flare", "gpt-image-1-mini")
+AI_SAMPLE_IMAGE_MODELS = ("gpt-image-2.6-flare", "gpt-image-2.6-sunburst")
+AI_IMAGE_COMPLEXITY = "medium"  # how much GPT Image 2.6 plans a picture (low | medium | high, its default):
+                                # one simple object needs no dense layout, and lower is faster
 AI_PRICES = {              # US dollars per million tokens (text in, out), OpenAI's pricing page on 2026-11-05
     "gpt-6-luna": (0.10, 0.50), "gpt-6.1-terra": (1.00, 5.00),
-    "gpt-image-2.5-flare": (5.00, 30.00), "gpt-image-1-mini": (2.00, 8.00)}
+    "gpt-image-2.6-flare": (5.00, 30.00), "gpt-image-2.6-sunburst": (5.00, 30.00)}
 AI_TEXT_TOP = 60           # Explore's hottest repos (no red flags) that get use cases and the hype text
 AI_PICTURE_TOP = 24        # ... and the hottest of them with no social image of their own get a picture
 AI_PICTURES_PER_RUN = 12
@@ -372,8 +375,11 @@ def api_reason(raw):
     err = body.get("error") if isinstance(body.get("error"), dict) else {}
     codes = [e.get("reason") for e in (err.get("details") or []) + (err.get("errors") or [])
              if isinstance(e, dict) and e.get("reason")]
-    return (" ".join(dict.fromkeys(str(c) for c in codes))[:60]  # OpenAI: {"error": {"code": ..., "type": ...}}
-            or str(err.get("status") or err.get("code") or err.get("type") or body.get("title") or "")[:60])
+    reason = (" ".join(dict.fromkeys(str(c) for c in codes))  # OpenAI: {"error": {"code": ..., "type": ...}}
+              or str(err.get("status") or err.get("code") or err.get("type") or body.get("title") or ""))
+    if isinstance(err.get("param"), str):  # OpenAI names the request field it refused
+        reason += f" ({err['param']})"
+    return reason[:60]
 
 
 def youtube(full_name, since, key):
@@ -3087,12 +3093,15 @@ def ai_notes(prompt, model, key):
 
 def ai_draw(idea, model, key):
     """(200, webp bytes, cents) for one card picture on a see-through background, or (status, reason, cents)."""
-    status, answer = openai("images/generations", {
+    payload = {
         "model": model, "n": 1, "size": "1024x1024", "quality": "medium", "background": "transparent",
         "output_format": "webp", "output_compression": 80,
         "prompt": f"{idea}. One simple, friendly illustration of that subject with soft light and gentle "
                   "shading, centered with space around it, on a transparent background. No text, letters, "
-                  "numbers, logos, screens or people."}, key, timeout=180, tries=1)
+                  "numbers, logos, screens or people."}
+    if model.startswith("gpt-image-2.6"):  # a GPT Image 2.6 field
+        payload["complexity"] = AI_IMAGE_COMPLEXITY
+    status, answer = openai("images/generations", payload, key, timeout=180, tries=1)
     if status != 200:
         return status, answer, 0.0
     spent = ai_cents(model, answer.get("usage") or {})
@@ -3169,8 +3178,9 @@ def ai():
             break
         status, image, cost = ai_draw(idea, AI_IMAGE_MODEL, key)
         spent += cost
-        if status == 400 and image in AI_REFUSED:
-            pictures[r["slug"]], changed = {"refused": image, "day": latest.isoformat()}, True
+        code = image.split(" ", 1)[0] if status == 400 else ""  # "moderation_blocked (prompt)" -> the code
+        if code in AI_REFUSED:
+            pictures[r["slug"]], changed = {"refused": code, "day": latest.isoformat()}, True
             continue
         if status == 422:
             continue
@@ -3194,6 +3204,13 @@ def ai_samples(picks, state, key, stamp):
     picture model, for Explore's hottest repos, in ai-samples/ (the workflow keeps it for 3 days)."""
     os.makedirs(AI_SAMPLES, exist_ok=True)
     spent, report = 0.0, []
+
+    def save():  # after every repo, so a step that dies part-way still leaves what it made
+        write(os.path.join(AI_SAMPLES, "samples.json"), json.dumps(
+            {"made": stamp, "spent_cents": round(spent, 2), "text_models": AI_SAMPLE_TEXT_MODELS,
+             "image_models": AI_SAMPLE_IMAGE_MODELS, "image_complexity": AI_IMAGE_COMPLEXITY,
+             "repos": report}, indent=1) + "\n")
+
     for r in picks:
         prompt, count = ai_prompt(r, state.get(r["slug"]) or {})
         entry = {"repo": r["name"], "description": r["description"], "read": count, "notes": {}, "pictures": {}}
@@ -3216,9 +3233,7 @@ def ai_samples(picks, state, key, stamp):
             else:
                 entry["pictures"][model] = {"error": f"HTTP {status} {image}".rstrip()}
         report.append(entry)
-    write(os.path.join(AI_SAMPLES, "samples.json"), json.dumps(
-        {"made": stamp, "spent_cents": round(spent, 2), "text_models": AI_SAMPLE_TEXT_MODELS,
-         "image_models": AI_SAMPLE_IMAGE_MODELS, "repos": report}, indent=1) + "\n")
+        save()
     print(f"     AI samples: {len(report)} repos, {spent:.1f}¢ spent, written to ai-samples/")
 
 
