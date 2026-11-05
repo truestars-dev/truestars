@@ -1215,7 +1215,8 @@ def render_how(updated):
       <li>a Hacker News post with {HN_MIN_POINTS}+ points in the last {HN_DAYS} days, with how much its stars
         jumped after it;</li>
       <li>a YouTube video from the last {YT_DAYS} days with {YT_MIN_VIEWS:,}+ views whose description links the
-        repo, with how much its stars jumped after it;</li>
+        repo, with how much its stars jumped after it when the video had more views than the stars that came
+        after it;</li>
       <li>{X_MIN_POSTS}+ posts on X that linked the repo in the last 7 days, reposts not counted;</li>
       <li>a release in the last week, shown only when a day after it brought at least {JUMP_X:g} times the repo's
         usual daily stars;</li>
@@ -2233,9 +2234,12 @@ def social_chips(row, repo, latest):
     videos = [v for v in (found.get("youtube") or {}).get("videos") or []
               if v["views"] >= YT_MIN_VIEWS and days_between(v["published"], latest) <= YT_DAYS]
     if videos:
-        top = videos[0]
-        lift = jump(repo["daily"], pacific_day(top["published"]), latest - dt.timedelta(days=1),
+        top, start = videos[0], pacific_day(videos[0]["published"])
+        lift = jump(repo["daily"], start, latest - dt.timedelta(days=1),
                     pacific_day(repo["meta"]["createdAt"]), 3) if repo else None
+        if lift and top["views"] < sum(repo["daily"].get((start + dt.timedelta(days=k)).isoformat(), 0)
+                                       for k in range(3)):
+            lift = None  # fewer views than the stars that followed: the video can't explain the jump
         channel = top["channel"] if len(top["channel"]) <= 24 else top["channel"][:23] + "…"
         chips.append({"kind": "youtube", "url": f"https://www.youtube.com/watch?v={top['id']}",
                       "text": f"YouTube · {fmt_count(top['views'])} views · {channel} · {fmt_day(top['published'])}"
