@@ -24,6 +24,11 @@ How Explore, Heat, the ranking and the check work: https://truestars.dev/how/
 Python 3.12 and a GitHub token (`GITHUB_TOKEN`, or a logged-in `gh`). No other installs. YouTube needs
 `GOOGLE_API_KEY` and X needs `X_BEARER_TOKEN`; without them those lookups are skipped. Bluesky needs no key.
 
+The AI step (`AI_MODE` in `truestars.py`, off for now) needs `OPENAI_API_KEY`. It writes a few uses and
+"What's the hype about" for the hottest repos, from the README and the public posts that link them, and draws
+pictures for the big Explore cards. `samples` writes them to `ai-samples/` only, to look at before anything
+goes on the site; `on` publishes them. Spending stops at `AI_RUN_CAP_CENTS` a run.
+
     python3 -I truestars.py           # collect today's data, then build the site into site/
     python3 -I truestars.py build     # rebuild the site from the saved data
 

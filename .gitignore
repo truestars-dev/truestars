@@ -6,3 +6,4 @@ __pycache__/
 run-daily.sh
 daily.off
 data/social.json
+ai-samples/

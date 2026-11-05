@@ -9,7 +9,7 @@ on:
     paths: ["truestars.py", ".github/workflows/**"]
   workflow_dispatch:
 permissions:
-  contents: write   # commit the day's history file
+  contents: write   # commit the day's history file and the AI pictures
   pages: write      # publish the site
   id-token: write
 concurrency:
@@ -27,13 +27,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}   # YouTube (and the Reddit test); optional
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}   # X post counts, prepaid; optional
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}   # the AI step, when AI_MODE in truestars.py is on; optional
       - name: Save the day's history
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/days
+          git add data   # the day's history file and the AI pictures (.gitignore leaves out the rest)
           git diff --cached --quiet || git commit -m "Daily data $(date -u +%F)"
           git push
+      - if: hashFiles('ai-samples/samples.json') != ''   # AI_MODE "samples": for the owner to look at, not the site
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-samples
+          path: ai-samples
+          retention-days: 3
       - if: vars.PAGES_ON == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
